@@ -3,4 +3,6 @@ uvicorn
 python-multipart
 edge-tts
 pillow
-jinja2
+numpy
+imageio
+imageio-ffmpeg
