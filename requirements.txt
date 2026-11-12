@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+python-multipart
+edge-tts
+pillow
+jinja2
