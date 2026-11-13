@@ -147,12 +147,7 @@ Return ONLY valid JSON matching this exact structure:
 
     print("All Gemini models failed -> using automatic luxury fallback plan.", flush=True)
     return _fallback_ad_plan(image_path, user_hint, language)
-            )
-            return json.loads(response.text)
-        except Exception:
-            continue
-    raise RuntimeError("Gemini API call failed. Check GEMINI_API_KEY.")
-
+ 
 
 async def create_female_voiceover(text: str, out_mp3: Path, language: str):
     voice = "hi-IN-SwaraNeural" if language == "hinglish" else "en-IN-NeerjaNeural"
