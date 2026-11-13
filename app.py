@@ -1,7 +1,10 @@
 import asyncio
 import base64
+import io
 import json
+import math
 import os
+import random
 import shutil
 import subprocess
 import threading
@@ -10,15 +13,11 @@ from pathlib import Path
 
 import edge_tts
 import httpx
+import numpy as np
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from google import genai
 from google.genai import types
-from PIL import Image
-import io
-import math
-import random
-import numpy as np
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFilter
 
@@ -28,7 +27,7 @@ WORK_DIR = Path("/tmp/ad_jobs")
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 JOBS = {}
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip().strip('"').strip("'")
 MODAL_VIDEO_URL = os.environ.get("MODAL_VIDEO_URL", "").strip().strip('"').strip("'")
 if MODAL_VIDEO_URL and not MODAL_VIDEO_URL.startswith(("http://", "https://")):
     MODAL_VIDEO_URL = "https://" + MODAL_VIDEO_URL
@@ -40,6 +39,8 @@ def get_duration(file_path: Path) -> float:
         "-of", "default=noprint_wrappers=1:nokey=1", str(file_path)
     ]
     return float(subprocess.check_output(cmd).decode().strip())
+
+
 def _fallback_ad_plan(image_path: Path, user_hint: str, language: str) -> dict:
     raw = image_path.stem.replace("_", " ").replace("-", " ").strip()
     brand = "".join(c for c in (raw.split()[0] if raw else "LUXURY") if c.isalnum()).upper() or "LUXURY"
@@ -153,7 +154,7 @@ Return ONLY valid JSON matching this exact structure:
 
     print("All Gemini models failed -> using automatic luxury fallback plan.", flush=True)
     return _fallback_ad_plan(image_path, user_hint, language)
- 
+
 
 async def create_female_voiceover(text: str, out_mp3: Path, language: str):
     voice = "hi-IN-SwaraNeural" if language == "hinglish" else "en-IN-NeerjaNeural"
@@ -187,7 +188,6 @@ def _extract_product_light(image_bytes: bytes) -> Image.Image:
                 img = img.crop(bbox)
             return img
 
-    # Clean luxury beveled card frame for collage / complex backgrounds
     mask = Image.new("L", (w, h), 0)
     ImageDraw.Draw(mask).rounded_rectangle([0, 0, w - 1, h - 1], radius=28, fill=255)
     img.putalpha(mask)
@@ -208,7 +208,7 @@ def generate_ai_video_clip(image_bytes: bytes, prompt: str, scene_style: str, as
     dims = {"9:16": (540, 960), "16:9": (960, 540), "1:1": (640, 640)}
     W, H = dims.get(aspect_ratio, (540, 960))
     fps = 24
-    total_frames = 56  # ~2.33s snappy commercial shot
+    total_frames = 56
 
     product = _extract_product_light(image_bytes)
     hero = product.copy()
@@ -217,7 +217,6 @@ def generate_ai_video_clip(image_bytes: bytes, prompt: str, scene_style: str, as
 
     rng = random.Random(hash(scene_style) & 0xFFFF)
 
-    # Prebuild static backgrounds per style
     if scene_style == "pedestal_blinds":
         bg = _make_gradient_bg(W, H, (198, 192, 182), (242, 238, 230))
         d = ImageDraw.Draw(bg)
@@ -240,7 +239,6 @@ def generate_ai_video_clip(image_bytes: bytes, prompt: str, scene_style: str, as
         bg = _make_gradient_bg(W, H, (190, 198, 208), (241, 245, 249))
         twin_b = hero.copy()
         twin_b.thumbnail((int(pw * 0.68), int(ph * 0.68)), Image.Resampling.LANCZOS)
-        tw, th = twin_b.size
 
     elif scene_style == "macro_detail":
         bg = _make_gradient_bg(W, H, (10, 14, 24), (28, 38, 58))
@@ -254,7 +252,7 @@ def generate_ai_video_clip(image_bytes: bytes, prompt: str, scene_style: str, as
         sd.polygon([(W * 0.25, 0), (W * 0.75, 0), (W * 0.92, H), (W * 0.08, H)], fill=(148, 197, 255, 20))
         sparks = [(rng.uniform(0, 2 * math.pi), rng.uniform(W * 0.22, W * 0.44), rng.randint(3, 8), rng.uniform(0.8, 2.0)) for _ in range(32)]
 
-    else:  # shatter_reveal
+    else:
         bg = _make_gradient_bg(W, H, (6, 11, 22), (20, 40, 78))
         grid = 6
         tiles = []
@@ -315,7 +313,7 @@ def generate_ai_video_clip(image_bytes: bytes, prompt: str, scene_style: str, as
                 cy = int(H // 2 + math.sin(a) * rad * 0.65)
                 sd.polygon([(cx, cy - sz), (cx + sz, cy), (cx, cy + sz), (cx - sz, cy)], fill=(226, 232, 240, 210))
 
-        else:  # shatter_reveal
+        else:
             ease = 1.0 - (1.0 - min(1.0, p / 0.55)) ** 3
             hx, hy = W // 2 - pw // 2, int(H * 0.48 - ph // 2 + math.sin(p * 6) * 8)
             if p < 0.55:
@@ -336,6 +334,7 @@ def generate_ai_video_clip(image_bytes: bytes, prompt: str, scene_style: str, as
     err = proc.stderr.read().decode(errors="ignore")
     if proc.wait() != 0:
         raise RuntimeError("FFmpeg clip render failed: " + err[-250:])
+
 
 def build_luxury_commercial(
     job_dir: Path,
@@ -360,7 +359,6 @@ def build_luxury_commercial(
     tag_file.write_text(tagline, encoding="utf-8")
     outro_file.write_text(f"PRODUCED FOR {hero_brand}", encoding="utf-8")
 
-    # Snappy 2.0s - 2.3s luxury commercial cuts + Dior-style centered typography
     styled_clips = []
     title_size = 96 if aspect_ratio == "9:16" else 112
 
@@ -368,27 +366,23 @@ def build_luxury_commercial(
         styled = job_dir / f"styled_{idx}.mp4"
         overlay = ""
         if idx == 0:
-            # Giant centered luxury Serif title on opening hero reveal
             overlay = (
                 f",drawtext=fontfile={serif_font}:textfile={hero_file}:fontcolor=white@0.95:"
                 f"fontsize={title_size}:shadowcolor=black@0.45:shadowx=3:shadowy=4:"
                 f"x=(w-text_w)/2:y=(h-text_h)/2+40"
             )
         elif idx == 2:
-            # Clean minimal caption on architectural pedestal shot
             overlay = (
                 f",drawtext=fontfile={sans_font}:textfile={tag_file}:fontcolor=white:"
                 f"fontsize=34:box=1:boxcolor=black@0.55:boxborderw=14:x=(w-text_w)/2:y=h-170"
             )
         elif idx == 4:
-            # Bold finale lockup
             overlay = (
                 f",drawtext=fontfile={sans_font}:textfile={outro_file}:fontcolor=white@0.95:"
                 f"fontsize=36:shadowcolor=black@0.5:shadowx=2:shadowy=2:"
                 f"x=(w-text_w)/2:y=(h-text_h)/2"
             )
 
-        # Speed up slightly (setpts=0.82*PTS) for ultra-snappy commercial pacing (~2.2s/shot)
         vf = (
             f"setpts=0.82*PTS,scale={w}:{h}:force_original_aspect_ratio=increase,"
             f"crop={w}:{h},fps=24,eq=contrast=1.10:saturation=1.15{overlay}"
@@ -404,7 +398,6 @@ def build_luxury_commercial(
         )
         styled_clips.append(styled)
 
-    # Fast beat-synced commercial transitions across all 5 shots
     d = [get_duration(c) for c in styled_clips]
     fade = 0.22
     o1 = max(0.5, d[0] - fade)
@@ -435,33 +428,49 @@ def build_luxury_commercial(
         check=True,
     )
 
-    # Sync duration with Female Voiceover + deep modern electronic commercial bass beat
     vid_dur = get_duration(merged_video)
     aud_dur = get_duration(voice_mp3)
     target_dur = max(vid_dur, aud_dur + 0.5)
-    pad_sec = max(0.0, target_dur - vid_dur)
+    pad_sec = round(max(0.0, target_dur - vid_dur), 2)
 
     final_mp4 = job_dir / "final_ad.mp4"
     audio_filter = (
-        f"aevalsrc=0.09*sin(2*PI*55*t)*exp(-4*mod(t,0.5))+0.04*sin(2*PI*165*t)*exp(-8*mod(t,0.25)):s=44100:d={target_dur}[bg];"
+        f"aevalsrc='0.09*sin(2*PI*55*t)*exp(-4*mod(t,0.5))+0.04*sin(2*PI*165*t)*exp(-8*mod(t,0.25))':s=44100:d={target_dur:.2f}[bg];"
         f"[1:a]aresample=44100,volume=1.40[vo];"
-        f"[vo][bg]amix=inputs=2:duration=first:dropout_transition=2[aout]"
+        f"[vo][bg]amix=inputs=2:duration=longest:dropout_transition=2[aout]"
     )
-    video_filter = f"[0:v]tpad=stop_mode=clone:stop_duration={pad_sec}[vfinal]"
+    video_filter = f"[0:v]tpad=stop_mode=clone:stop_duration={pad_sec:.2f}[vfinal]"
 
-    subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-i", str(merged_video),
-            "-i", str(voice_mp3),
-            "-filter_complex", f"{video_filter};{audio_filter}",
-            "-map", "[vfinal]", "-map", "[aout]",
-            "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-b:a", "128k",
-            "-t", f"{target_dur:.2f}", "-movflags", "+faststart", "-threads", "2",
-            str(final_mp4),
-        ],
-        check=True,
-    )
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-i", str(merged_video),
+                "-i", str(voice_mp3),
+                "-filter_complex", f"{video_filter};{audio_filter}",
+                "-map", "[vfinal]", "-map", "[aout]",
+                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "128k",
+                "-t", f"{target_dur:.2f}", "-movflags", "+faststart", "-threads", "2",
+                str(final_mp4),
+            ],
+            check=True,
+        )
+    except subprocess.CalledProcessError:
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-i", str(merged_video),
+                "-i", str(voice_mp3),
+                "-vf", f"tpad=stop_mode=clone:stop_duration={pad_sec:.2f}",
+                "-map", "0:v", "-map", "1:a",
+                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "128k",
+                "-t", f"{target_dur:.2f}", "-movflags", "+faststart", "-threads", "2",
+                str(final_mp4),
+            ],
+            check=True,
+        )
     return final_mp4
 
 
