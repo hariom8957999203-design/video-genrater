@@ -34,9 +34,58 @@ def get_duration(file_path: Path) -> float:
         "-of", "default=noprint_wrappers=1:nokey=1", str(file_path)
     ]
     return float(subprocess.check_output(cmd).decode().strip())
+def _fallback_ad_plan(image_path: Path, user_hint: str, language: str) -> dict:
+    raw = image_path.stem.replace("_", " ").replace("-", " ").strip()
+    brand = "".join(c for c in (raw.split()[0] if raw else "LUXURY") if c.isalnum()).upper() or "LUXURY"
+    hint_clean = (user_hint or "luxury perfection").strip()
+
+    if language == "hinglish":
+        script = (
+            f"Jab style aur class ki baat ho, toh dekho {brand}. "
+            f"Pure {hint_clean.lower()} ke saath unmatched design aur royal finishing. "
+            f"Apna standard elevate karo, grab your {brand} today!"
+        )
+    else:
+        script = (
+            f"When luxury meets pure performance, meet {brand}. "
+            f"Crafted with {hint_clean.lower()}, precision engineering, and timeless elegance. "
+            f"Elevate your everyday style and claim yours today."
+        )
+
+    return {
+        "hero_brand": brand[:18],
+        "tagline": "BUILT TO STAND OUT",
+        "voiceover_script": script,
+        "scenes": [
+            {
+                "scene_style": "shatter_reveal",
+                "video_prompt": f"High-end 3D CGI luxury commercial shot: dark blue and metallic fragments shattering outward off the floating {brand} product ({hint_clean}) against misty studio light, smooth camera push-in, photorealistic Cinema4D Octane render."
+            },
+            {
+                "scene_style": "macro_detail",
+                "video_prompt": f"Extreme macro 3D commercial close-up gliding smoothly across the glossy details and texture of {brand}, crisp studio rim light sweeping over reflections, ultra sharp."
+            },
+            {
+                "scene_style": "pedestal_blinds",
+                "video_prompt": f"Sleek architectural luxury commercial shot: {brand} products standing on white stepped pedestals, diagonal window blind sunlight shadows shifting gently across the background, blurred green leaves swaying softly, smooth horizontal dolly."
+            },
+            {
+                "scene_style": "twin_float",
+                "video_prompt": f"Minimalist bright grey studio commercial: two floating {brand} products levitating in mid-air and rotating smoothly past each other with crisp reflections, high-fashion CGI aesthetic."
+            },
+            {
+                "scene_style": "chrome_finale",
+                "video_prompt": f"Dramatic finale 3D CGI shot: silver chrome shatter particles swirling cleanly around the hero {brand} product under bright spotlight, luxury commercial packshot."
+            },
+        ],
+    }
 
 
 def analyze_product_with_gemini(image_path: Path, user_hint: str, language: str) -> dict:
+    if not GEMINI_API_KEY:
+        print("GEMINI_API_KEY is empty -> using fallback ad plan.", flush=True)
+        return _fallback_ad_plan(image_path, user_hint, language)
+
     client = genai.Client(api_key=GEMINI_API_KEY)
     img = Image.open(image_path).convert("RGB")
 
@@ -81,13 +130,23 @@ Return ONLY valid JSON matching this exact structure:
   ]
 }}
 """
-    # Use free-tier supported Gemini 3.5 Flash-Lite with safe fallback
-    for model_name in ("gemini-3.5-flash-lite", "gemini-3-flash-preview"):
+    for model_name in ("gemini-3.5-flash-lite", "gemini-3-flash-preview", "gemini-2.5-flash"):
         try:
             response = client.models.generate_content(
                 model=model_name,
                 contents=[system_prompt, img],
                 config=types.GenerateContentConfig(response_mime_type="application/json"),
+            )
+            txt = (response.text or "").strip()
+            if txt.startswith("```"):
+                txt = txt.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            return json.loads(txt)
+        except Exception as e:
+            print(f"Gemini failed on {model_name}: {repr(e)}", flush=True)
+            continue
+
+    print("All Gemini models failed -> using automatic luxury fallback plan.", flush=True)
+    return _fallback_ad_plan(image_path, user_hint, language)
             )
             return json.loads(response.text)
         except Exception:
