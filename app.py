@@ -23,7 +23,9 @@ WORK_DIR.mkdir(parents=True, exist_ok=True)
 JOBS = {}
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-MODAL_VIDEO_URL = os.environ.get("MODAL_VIDEO_URL", "")
+MODAL_VIDEO_URL = os.environ.get("MODAL_VIDEO_URL", "").strip().strip('"').strip("'")
+if MODAL_VIDEO_URL and not MODAL_VIDEO_URL.startswith(("http://", "https://")):
+    MODAL_VIDEO_URL = "https://" + MODAL_VIDEO_URL
 
 
 def get_duration(file_path: Path) -> float:
