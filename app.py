@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import gc
 import io
 import json
 import math
@@ -8,6 +9,7 @@ import random
 import shutil
 import subprocess
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -64,37 +66,22 @@ def _fallback_ad_plan(image_path: Path, user_hint: str, language: str) -> dict:
         "tagline": "BUILT TO STAND OUT",
         "voiceover_script": script,
         "scenes": [
-            {
-                "scene_style": "shatter_reveal",
-                "video_prompt": f"High-end 3D CGI luxury commercial shot: dark blue and metallic fragments shattering outward off the floating {brand} product ({hint_clean}) against misty studio light, smooth camera push-in, photorealistic Cinema4D Octane render."
-            },
-            {
-                "scene_style": "macro_detail",
-                "video_prompt": f"Extreme macro 3D commercial close-up gliding smoothly across the glossy details and texture of {brand}, crisp studio rim light sweeping over reflections, ultra sharp."
-            },
-            {
-                "scene_style": "pedestal_blinds",
-                "video_prompt": f"Sleek architectural luxury commercial shot: {brand} products standing on white stepped pedestals, diagonal window blind sunlight shadows shifting gently across the background, blurred green leaves swaying softly, smooth horizontal dolly."
-            },
-            {
-                "scene_style": "twin_float",
-                "video_prompt": f"Minimalist bright grey studio commercial: two floating {brand} products levitating in mid-air and rotating smoothly past each other with crisp reflections, high-fashion CGI aesthetic."
-            },
-            {
-                "scene_style": "chrome_finale",
-                "video_prompt": f"Dramatic finale 3D CGI shot: silver chrome shatter particles swirling cleanly around the hero {brand} product under bright spotlight, luxury commercial packshot."
-            },
+            {"scene_style": "shatter_reveal", "video_prompt": f"3D CGI shatter reveal for {brand}"},
+            {"scene_style": "macro_detail", "video_prompt": f"Macro close-up for {brand}"},
+            {"scene_style": "pedestal_blinds", "video_prompt": f"Pedestal blinds shadows for {brand}"},
+            {"scene_style": "twin_float", "video_prompt": f"Twin float studio shot for {brand}"},
+            {"scene_style": "chrome_finale", "video_prompt": f"Chrome finale packshot for {brand}"},
         ],
     }
 
 
 def analyze_product_with_gemini(image_path: Path, user_hint: str, language: str) -> dict:
     if not GEMINI_API_KEY:
-        print("GEMINI_API_KEY is empty -> using fallback ad plan.", flush=True)
         return _fallback_ad_plan(image_path, user_hint, language)
 
     client = genai.Client(api_key=GEMINI_API_KEY)
     img = Image.open(image_path).convert("RGB")
+    img.thumbnail((800, 800), Image.Resampling.LANCZOS)
 
     lang_instruction = (
         "Write the voiceover_script in crisp, luxurious conversational Hinglish (Hindi in Roman script mixed with stylish English words, confident Indian female luxury ad voice)."
@@ -114,26 +101,11 @@ Return ONLY valid JSON matching this exact structure:
   "tagline": "2-4 word punchy tagline (e.g. BUILT TO WIN)",
   "voiceover_script": "28 to 36 words total (approx 11-13 seconds spoken crisply). Confident luxury hook, bold feature line, punchy call-to-action.",
   "scenes": [
-    {{
-      "scene_style": "shatter_reveal",
-      "video_prompt": "High-end 3D CGI luxury commercial shot: dark blue and metallic fragments shattering outward off the floating product against misty studio light, smooth camera push-in, photorealistic Cinema4D Octane render."
-    }},
-    {{
-      "scene_style": "macro_detail",
-      "video_prompt": "Extreme macro 3D commercial close-up gliding smoothly across the glossy details and texture of the product, crisp studio rim light sweeping over reflections, ultra sharp."
-    }},
-    {{
-      "scene_style": "pedestal_blinds",
-      "video_prompt": "Sleek architectural luxury commercial shot: three products standing on white stepped pedestals, diagonal window blind sunlight shadows shifting gently across the background, blurred green leaves swaying softly, smooth horizontal dolly."
-    }},
-    {{
-      "scene_style": "twin_float",
-      "video_prompt": "Minimalist bright grey studio commercial: two floating products levitating in mid-air and rotating smoothly past each other with crisp reflections, high-fashion CGI aesthetic."
-    }},
-    {{
-      "scene_style": "chrome_finale",
-      "video_prompt": "Dramatic finale 3D CGI shot: silver chrome shatter particles swirling cleanly around the hero product under bright spotlight, luxury commercial packshot."
-    }}
+    {{"scene_style": "shatter_reveal", "video_prompt": "3D CGI shatter reveal"}},
+    {{"scene_style": "macro_detail", "video_prompt": "Macro detail sweep"}},
+    {{"scene_style": "pedestal_blinds", "video_prompt": "Pedestal window blinds shadows"}},
+    {{"scene_style": "twin_float", "video_prompt": "Twin floating rotation"}},
+    {{"scene_style": "chrome_finale", "video_prompt": "Chrome sparkle finale"}}
   ]
 }}
 """
@@ -151,8 +123,6 @@ Return ONLY valid JSON matching this exact structure:
         except Exception as e:
             print(f"Gemini failed on {model_name}: {repr(e)}", flush=True)
             continue
-
-    print("All Gemini models failed -> using automatic luxury fallback plan.", flush=True)
     return _fallback_ad_plan(image_path, user_hint, language)
 
 
@@ -169,7 +139,7 @@ async def create_female_voiceover(text: str, out_mp3: Path, language: str):
 
 def _extract_product_light(image_bytes: bytes) -> Image.Image:
     img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
-    img.thumbnail((560, 560), Image.Resampling.LANCZOS)
+    img.thumbnail((480, 480), Image.Resampling.LANCZOS)
     arr = np.array(img, dtype=np.float32)
     h, w, _ = arr.shape
 
@@ -189,7 +159,7 @@ def _extract_product_light(image_bytes: bytes) -> Image.Image:
             return img
 
     mask = Image.new("L", (w, h), 0)
-    ImageDraw.Draw(mask).rounded_rectangle([0, 0, w - 1, h - 1], radius=28, fill=255)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, w - 1, h - 1], radius=24, fill=255)
     img.putalpha(mask)
     return img
 
@@ -204,17 +174,15 @@ def _make_gradient_bg(w: int, h: int, c_edge: tuple, c_center: tuple) -> Image.I
     return Image.fromarray(rgb, "RGB").convert("RGBA")
 
 
-def generate_ai_video_clip(image_bytes: bytes, prompt: str, scene_style: str, aspect_ratio: str, out_mp4: Path):
-    dims = {"9:16": (540, 960), "16:9": (960, 540), "1:1": (640, 640)}
+def generate_ai_video_clip(product: Image.Image, scene_style: str, aspect_ratio: str, out_mp4: Path):
+    dims = {"9:16": (540, 960), "16:9": (960, 540)}
     W, H = dims.get(aspect_ratio, (540, 960))
     fps = 24
-    total_frames = 56
+    total_frames = 54
 
-    product = _extract_product_light(image_bytes)
     hero = product.copy()
     hero.thumbnail((int(W * 0.62), int(H * 0.46)), Image.Resampling.LANCZOS)
     pw, ph = hero.size
-
     rng = random.Random(hash(scene_style) & 0xFFFF)
 
     if scene_style == "pedestal_blinds":
@@ -229,7 +197,7 @@ def generate_ai_video_clip(image_bytes: bytes, prompt: str, scene_style: str, as
         bd = ImageDraw.Draw(blinds)
         for off in range(-H - 240, W + H + 240, 95):
             bd.polygon([(off, 0), (off + 46, 0), (off - H - 240 + 46, H + 240), (off - H - 240, H + 240)], fill=(25, 22, 18, 42))
-        blinds = blinds.filter(ImageFilter.GaussianBlur(7))
+        blinds = blinds.filter(ImageFilter.GaussianBlur(6))
 
         side_prod = product.copy()
         side_prod.thumbnail((int(pw * 0.56), int(ph * 0.56)), Image.Resampling.LANCZOS)
@@ -250,7 +218,7 @@ def generate_ai_video_clip(image_bytes: bytes, prompt: str, scene_style: str, as
         bg = _make_gradient_bg(W, H, (5, 7, 13), (26, 36, 58))
         sd = ImageDraw.Draw(bg)
         sd.polygon([(W * 0.25, 0), (W * 0.75, 0), (W * 0.92, H), (W * 0.08, H)], fill=(148, 197, 255, 20))
-        sparks = [(rng.uniform(0, 2 * math.pi), rng.uniform(W * 0.22, W * 0.44), rng.randint(3, 8), rng.uniform(0.8, 2.0)) for _ in range(32)]
+        sparks = [(rng.uniform(0, 2 * math.pi), rng.uniform(W * 0.22, W * 0.44), rng.randint(3, 8), rng.uniform(0.8, 2.0)) for _ in range(30)]
 
     else:
         bg = _make_gradient_bg(W, H, (6, 11, 22), (20, 40, 78))
@@ -263,13 +231,13 @@ def generate_ai_video_clip(image_bytes: bytes, prompt: str, scene_style: str, as
                 x1 = pw if gx == grid - 1 else (gx + 1) * tw_t
                 y1 = ph if gy == grid - 1 else (gy + 1) * th_t
                 tiles.append((hero.crop((x0, y0, x1, y1)), x0, y0, rng.randint(-W // 2, W // 2), rng.randint(-H // 3, H // 3)))
-        frags = [(rng.randint(0, W), rng.randint(0, H), rng.randint(6, 15), rng.uniform(1.0, 2.5)) for _ in range(28)]
+        frags = [(rng.randint(0, W), rng.randint(0, H), rng.randint(6, 14), rng.uniform(1.0, 2.4)) for _ in range(24)]
 
     cmd = [
         "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
         "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", str(fps), "-i", "-",
-        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-threads", "2",
-        str(out_mp4),
+        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+        "-pix_fmt", "yuv420p", "-threads", "1", str(out_mp4),
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -288,8 +256,8 @@ def generate_ai_video_clip(image_bytes: bytes, prompt: str, scene_style: str, as
         elif scene_style == "twin_float":
             bob1 = int(math.sin(p * math.pi * 2) * 18)
             bob2 = int(math.sin(p * math.pi * 2 + math.pi) * 20)
-            rot1 = hero.rotate(math.sin(p * math.pi * 2) * 5, expand=True, resample=Image.Resampling.BICUBIC)
-            rot2 = twin_b.rotate(-math.sin(p * math.pi * 2) * 7, expand=True, resample=Image.Resampling.BICUBIC)
+            rot1 = hero.rotate(math.sin(p * math.pi * 2) * 5, expand=True, resample=Image.Resampling.BILINEAR)
+            rot2 = twin_b.rotate(-math.sin(p * math.pi * 2) * 7, expand=True, resample=Image.Resampling.BILINEAR)
             frame.paste(rot2, (int(W * 0.68 - rot2.width // 2), int(H * 0.34 - rot2.height // 2 + bob2)), rot2)
             frame.paste(rot1, (int(W * 0.38 - rot1.width // 2), int(H * 0.50 - rot1.height // 2 + bob1)), rot1)
 
@@ -300,7 +268,7 @@ def generate_ai_video_clip(image_bytes: bytes, prompt: str, scene_style: str, as
             streak = Image.new("RGBA", (W, H), (0, 0, 0, 0))
             sx = int(-W * 0.3 + p * W * 1.6)
             ImageDraw.Draw(streak).polygon([(sx, 0), (sx + 90, 0), (sx - H // 2 + 90, H), (sx - H // 2, H)], fill=(255, 255, 255, 34))
-            frame = Image.alpha_composite(frame, streak.filter(ImageFilter.GaussianBlur(14)))
+            frame = Image.alpha_composite(frame, streak.filter(ImageFilter.GaussianBlur(10)))
 
         elif scene_style == "chrome_finale":
             sc = 0.96 + 0.08 * p
@@ -334,6 +302,8 @@ def generate_ai_video_clip(image_bytes: bytes, prompt: str, scene_style: str, as
     err = proc.stderr.read().decode(errors="ignore")
     if proc.wait() != 0:
         raise RuntimeError("FFmpeg clip render failed: " + err[-250:])
+    del bg
+    gc.collect()
 
 
 def build_luxury_commercial(
@@ -343,7 +313,7 @@ def build_luxury_commercial(
     plan: dict,
     aspect_ratio: str,
 ) -> Path:
-    w, h = (720, 1280) if aspect_ratio == "9:16" else (1280, 720)
+    w, h = (540, 960) if aspect_ratio == "9:16" else (960, 540)
     sans_font = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
     serif_font = "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf"
     if not Path(serif_font).exists():
@@ -360,7 +330,7 @@ def build_luxury_commercial(
     outro_file.write_text(f"PRODUCED FOR {hero_brand}", encoding="utf-8")
 
     styled_clips = []
-    title_size = 96 if aspect_ratio == "9:16" else 112
+    title_size = 72 if aspect_ratio == "9:16" else 84
 
     for idx, clip in enumerate(raw_clips):
         styled = job_dir / f"styled_{idx}.mp4"
@@ -369,64 +339,49 @@ def build_luxury_commercial(
             overlay = (
                 f",drawtext=fontfile={serif_font}:textfile={hero_file}:fontcolor=white@0.95:"
                 f"fontsize={title_size}:shadowcolor=black@0.45:shadowx=3:shadowy=4:"
-                f"x=(w-text_w)/2:y=(h-text_h)/2+40"
+                f"x=(w-text_w)/2:y=(h-text_h)/2+30"
             )
         elif idx == 2:
             overlay = (
                 f",drawtext=fontfile={sans_font}:textfile={tag_file}:fontcolor=white:"
-                f"fontsize=34:box=1:boxcolor=black@0.55:boxborderw=14:x=(w-text_w)/2:y=h-170"
+                f"fontsize=26:box=1:boxcolor=black@0.55:boxborderw=10:x=(w-text_w)/2:y=h-120"
             )
         elif idx == 4:
             overlay = (
                 f",drawtext=fontfile={sans_font}:textfile={outro_file}:fontcolor=white@0.95:"
-                f"fontsize=36:shadowcolor=black@0.5:shadowx=2:shadowy=2:"
+                f"fontsize=28:shadowcolor=black@0.5:shadowx=2:shadowy=2:"
                 f"x=(w-text_w)/2:y=(h-text_h)/2"
             )
 
+        out_st = max(0.5, get_duration(clip) * 0.85 - 0.25)
         vf = (
-            f"setpts=0.82*PTS,scale={w}:{h}:force_original_aspect_ratio=increase,"
-            f"crop={w}:{h},fps=24,eq=contrast=1.10:saturation=1.15{overlay}"
+            f"setpts=0.85*PTS,scale={w}:{h}:force_original_aspect_ratio=increase,"
+            f"crop={w}:{h},fps=24,eq=contrast=1.10:saturation=1.15{overlay},"
+            f"fade=t=in:st=0:d=0.18,fade=t=out:st={out_st:.2f}:d=0.20"
         )
         subprocess.run(
             [
                 "ffmpeg", "-y", "-i", str(clip),
                 "-vf", vf, "-an",
-                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-threads", "2",
-                str(styled),
+                "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+                "-pix_fmt", "yuv420p", "-threads", "1", str(styled),
             ],
             check=True,
         )
+        clip.unlink(missing_ok=True)
         styled_clips.append(styled)
-
-    d = [get_duration(c) for c in styled_clips]
-    fade = 0.22
-    o1 = max(0.5, d[0] - fade)
-    o2 = max(1.0, o1 + d[1] - fade)
-    o3 = max(1.5, o2 + d[2] - fade)
-    o4 = max(2.0, o3 + d[3] - fade)
+        gc.collect()
 
     merged_video = job_dir / "merged_video.mp4"
-    filter_complex = (
-        f"[0:v][1:v]xfade=transition=fadewhite:duration={fade}:offset={o1}[v01];"
-        f"[v01][2:v]xfade=transition=slideleft:duration={fade}:offset={o2}[v02];"
-        f"[v02][3:v]xfade=transition=fade:duration={fade}:offset={o3}[v03];"
-        f"[v03][4:v]xfade=transition=fadewhite:duration={fade}:offset={o4}[vout]"
-    )
+    concat_file = job_dir / "concat.txt"
+    concat_file.write_text("\n".join(f"file '{c.resolve()}'" for c in styled_clips), encoding="utf-8")
+
     subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-i", str(styled_clips[0]),
-            "-i", str(styled_clips[1]),
-            "-i", str(styled_clips[2]),
-            "-i", str(styled_clips[3]),
-            "-i", str(styled_clips[4]),
-            "-filter_complex", filter_complex,
-            "-map", "[vout]",
-            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-threads", "2",
-            str(merged_video),
-        ],
+        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", str(merged_video)],
         check=True,
     )
+    for c in styled_clips:
+        c.unlink(missing_ok=True)
 
     vid_dur = get_duration(merged_video)
     aud_dur = get_duration(voice_mp3)
@@ -449,9 +404,9 @@ def build_luxury_commercial(
                 "-i", str(voice_mp3),
                 "-filter_complex", f"{video_filter};{audio_filter}",
                 "-map", "[vfinal]", "-map", "[aout]",
-                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-pix_fmt", "yuv420p",
                 "-c:a", "aac", "-b:a", "128k",
-                "-t", f"{target_dur:.2f}", "-movflags", "+faststart", "-threads", "2",
+                "-t", f"{target_dur:.2f}", "-movflags", "+faststart", "-threads", "1",
                 str(final_mp4),
             ],
             check=True,
@@ -464,13 +419,15 @@ def build_luxury_commercial(
                 "-i", str(voice_mp3),
                 "-vf", f"tpad=stop_mode=clone:stop_duration={pad_sec:.2f}",
                 "-map", "0:v", "-map", "1:a",
-                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-pix_fmt", "yuv420p",
                 "-c:a", "aac", "-b:a", "128k",
-                "-t", f"{target_dur:.2f}", "-movflags", "+faststart", "-threads", "2",
+                "-t", f"{target_dur:.2f}", "-movflags", "+faststart", "-threads", "1",
                 str(final_mp4),
             ],
             check=True,
         )
+    merged_video.unlink(missing_ok=True)
+    gc.collect()
     return final_mp4
 
 
@@ -487,24 +444,21 @@ def run_pipeline(job_id: str, image_path: Path, hint: str, language: str, aspect
         voice_mp3 = job_dir / "voice.mp3"
         asyncio.run(create_female_voiceover(plan["voiceover_script"], voice_mp3, language))
 
-        img_bytes = image_path.read_bytes()
+        product_img = _extract_product_light(image_path.read_bytes())
         raw_clips = []
         for idx, scene in enumerate(plan["scenes"]):
             JOBS[job_id]["step"] = f"3D CGI AI Scene {idx + 1}/5 ({scene['scene_style']}) render ho raha hai..."
             JOBS[job_id]["progress"] = 30 + (idx * 12)
             clip_path = job_dir / f"raw_{idx}.mp4"
-            generate_ai_video_clip(
-                img_bytes,
-                scene["video_prompt"],
-                scene["scene_style"],
-                aspect_ratio,
-                clip_path,
-            )
+            generate_ai_video_clip(product_img, scene["scene_style"], aspect_ratio, clip_path)
             raw_clips.append(clip_path)
+
+        del product_img
+        gc.collect()
 
         JOBS[job_id]["step"] = "Beat-synced luxury transitions & typography edit ho rahe hain..."
         JOBS[job_id]["progress"] = 92
-        final_mp4 = build_luxury_commercial(job_dir, raw_clips, voice_mp3, plan, aspect_ratio)
+        build_luxury_commercial(job_dir, raw_clips, voice_mp3, plan, aspect_ratio)
 
         JOBS[job_id].update({
             "status": "done",
@@ -531,6 +485,11 @@ async def generate_ad(
     language: str = Form("hinglish"),
     aspect_ratio: str = Form("9:16"),
 ):
+    now = time.time()
+    for old in WORK_DIR.iterdir():
+        if old.is_dir() and (now - old.stat().st_mtime) > 600:
+            shutil.rmtree(old, ignore_errors=True)
+
     job_id = uuid.uuid4().hex[:10]
     job_dir = WORK_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
