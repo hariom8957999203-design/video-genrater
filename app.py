@@ -15,6 +15,12 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from google import genai
 from google.genai import types
 from PIL import Image
+import io
+import math
+import random
+import numpy as np
+from gtts import gTTS
+from PIL import Image, ImageDraw, ImageFilter
 
 app = FastAPI(title="AI Luxury Product Ad Studio")
 
@@ -151,25 +157,185 @@ Return ONLY valid JSON matching this exact structure:
 
 async def create_female_voiceover(text: str, out_mp3: Path, language: str):
     voice = "hi-IN-SwaraNeural" if language == "hinglish" else "en-IN-NeerjaNeural"
-    communicate = edge_tts.Communicate(text=text, voice=voice, rate="+8%")
-    await communicate.save(str(out_mp3))
+    try:
+        communicate = edge_tts.Communicate(text=text, voice=voice, rate="+8%")
+        await communicate.save(str(out_mp3))
+    except Exception as e:
+        print(f"Edge-TTS failed ({e}), using gTTS fallback...", flush=True)
+        tts_lang = "hi" if language == "hinglish" else "en"
+        gTTS(text=text, lang=tts_lang, tld="co.in").save(str(out_mp3))
+
+
+def _extract_product_light(image_bytes: bytes) -> Image.Image:
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+    img.thumbnail((560, 560), Image.Resampling.LANCZOS)
+    arr = np.array(img, dtype=np.float32)
+    h, w, _ = arr.shape
+
+    border = np.concatenate([arr[0, :, :3], arr[-1, :, :3], arr[:, 0, :3], arr[:, -1, :3]], axis=0)
+    bg_rgb = np.median(border, axis=0)
+    std = float(np.mean(np.std(border, axis=0)))
+
+    if std < 36.0:
+        dist = np.linalg.norm(arr[:, :, :3] - bg_rgb, axis=2)
+        alpha = np.clip((dist - 18.0) / 28.0, 0.0, 1.0) * 255.0
+        if np.mean(alpha > 128) > 0.12:
+            mask = Image.fromarray(alpha.astype(np.uint8), "L").filter(ImageFilter.GaussianBlur(1))
+            img.putalpha(mask)
+            bbox = img.getbbox()
+            if bbox:
+                img = img.crop(bbox)
+            return img
+
+    # Clean luxury beveled card frame for collage / complex backgrounds
+    mask = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, w - 1, h - 1], radius=28, fill=255)
+    img.putalpha(mask)
+    return img
+
+
+def _make_gradient_bg(w: int, h: int, c_edge: tuple, c_center: tuple) -> Image.Image:
+    y, x = np.mgrid[0:h, 0:w]
+    dist = np.sqrt(((x - w * 0.5) / (w * 0.65)) ** 2 + ((y - h * 0.44) / (h * 0.55)) ** 2)
+    t = np.clip(1.0 - dist, 0.0, 1.0) ** 1.6
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    for ch in range(3):
+        rgb[:, :, ch] = np.clip(c_edge[ch] + t * (c_center[ch] - c_edge[ch]), 0, 255).astype(np.uint8)
+    return Image.fromarray(rgb, "RGB").convert("RGBA")
 
 
 def generate_ai_video_clip(image_bytes: bytes, prompt: str, scene_style: str, aspect_ratio: str, out_mp4: Path):
-    if not MODAL_VIDEO_URL:
-        raise RuntimeError("MODAL_VIDEO_URL environment variable is not set.")
+    dims = {"9:16": (540, 960), "16:9": (960, 540), "1:1": (640, 640)}
+    W, H = dims.get(aspect_ratio, (540, 960))
+    fps = 24
+    total_frames = 56  # ~2.33s snappy commercial shot
 
-    payload = {
-        "image_base64": base64.b64encode(image_bytes).decode("utf-8"),
-        "prompt": prompt,
-        "scene_style": scene_style,
-        "aspect_ratio": aspect_ratio,
-    }
-    with httpx.Client(timeout=420.0) as client:
-        resp = client.post(MODAL_VIDEO_URL, json=payload)
-        resp.raise_for_status()
-        out_mp4.write_bytes(resp.content)
+    product = _extract_product_light(image_bytes)
+    hero = product.copy()
+    hero.thumbnail((int(W * 0.62), int(H * 0.46)), Image.Resampling.LANCZOS)
+    pw, ph = hero.size
 
+    rng = random.Random(hash(scene_style) & 0xFFFF)
+
+    # Prebuild static backgrounds per style
+    if scene_style == "pedestal_blinds":
+        bg = _make_gradient_bg(W, H, (198, 192, 182), (242, 238, 230))
+        d = ImageDraw.Draw(bg)
+        ped_y = int(H * 0.72)
+        d.rectangle([int(W * 0.10), ped_y + 24, int(W * 0.34), H], fill=(225, 222, 216, 255))
+        d.rectangle([int(W * 0.66), ped_y + 24, int(W * 0.90), H], fill=(225, 222, 216, 255))
+        d.rectangle([int(W * 0.30), ped_y, int(W * 0.70), H], fill=(246, 244, 240, 255), outline=(210, 206, 198, 255), width=2)
+
+        blinds = Image.new("RGBA", (W + 240, H + 240), (0, 0, 0, 0))
+        bd = ImageDraw.Draw(blinds)
+        for off in range(-H - 240, W + H + 240, 95):
+            bd.polygon([(off, 0), (off + 46, 0), (off - H - 240 + 46, H + 240), (off - H - 240, H + 240)], fill=(25, 22, 18, 42))
+        blinds = blinds.filter(ImageFilter.GaussianBlur(7))
+
+        side_prod = product.copy()
+        side_prod.thumbnail((int(pw * 0.56), int(ph * 0.56)), Image.Resampling.LANCZOS)
+        sw, sh = side_prod.size
+
+    elif scene_style == "twin_float":
+        bg = _make_gradient_bg(W, H, (190, 198, 208), (241, 245, 249))
+        twin_b = hero.copy()
+        twin_b.thumbnail((int(pw * 0.68), int(ph * 0.68)), Image.Resampling.LANCZOS)
+        tw, th = twin_b.size
+
+    elif scene_style == "macro_detail":
+        bg = _make_gradient_bg(W, H, (10, 14, 24), (28, 38, 58))
+        macro = product.copy()
+        macro.thumbnail((int(W * 1.35), int(H * 1.15)), Image.Resampling.LANCZOS)
+        mw, mh = macro.size
+
+    elif scene_style == "chrome_finale":
+        bg = _make_gradient_bg(W, H, (5, 7, 13), (26, 36, 58))
+        sd = ImageDraw.Draw(bg)
+        sd.polygon([(W * 0.25, 0), (W * 0.75, 0), (W * 0.92, H), (W * 0.08, H)], fill=(148, 197, 255, 20))
+        sparks = [(rng.uniform(0, 2 * math.pi), rng.uniform(W * 0.22, W * 0.44), rng.randint(3, 8), rng.uniform(0.8, 2.0)) for _ in range(32)]
+
+    else:  # shatter_reveal
+        bg = _make_gradient_bg(W, H, (6, 11, 22), (20, 40, 78))
+        grid = 6
+        tiles = []
+        tw_t, th_t = max(1, pw // grid), max(1, ph // grid)
+        for gy in range(grid):
+            for gx in range(grid):
+                x0, y0 = gx * tw_t, gy * th_t
+                x1 = pw if gx == grid - 1 else (gx + 1) * tw_t
+                y1 = ph if gy == grid - 1 else (gy + 1) * th_t
+                tiles.append((hero.crop((x0, y0, x1, y1)), x0, y0, rng.randint(-W // 2, W // 2), rng.randint(-H // 3, H // 3)))
+        frags = [(rng.randint(0, W), rng.randint(0, H), rng.randint(6, 15), rng.uniform(1.0, 2.5)) for _ in range(28)]
+
+    cmd = [
+        "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
+        "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", str(fps), "-i", "-",
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-threads", "2",
+        str(out_mp4),
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    for f in range(total_frames):
+        p = f / max(1, total_frames - 1)
+        frame = bg.copy()
+
+        if scene_style == "pedestal_blinds":
+            pan = int((p - 0.5) * 32)
+            frame.paste(side_prod, (int(W * 0.22 - sw // 2) + pan, int(H * 0.72 + 24 - sh)), side_prod)
+            frame.paste(side_prod, (int(W * 0.78 - sw // 2) + pan, int(H * 0.72 + 24 - sh)), side_prod)
+            frame.paste(hero, (W // 2 - pw // 2 + pan, int(H * 0.72 - ph)), hero)
+            shift = int(p * 85)
+            frame = Image.alpha_composite(frame, blinds.crop((shift, shift, shift + W, shift + H)))
+
+        elif scene_style == "twin_float":
+            bob1 = int(math.sin(p * math.pi * 2) * 18)
+            bob2 = int(math.sin(p * math.pi * 2 + math.pi) * 20)
+            rot1 = hero.rotate(math.sin(p * math.pi * 2) * 5, expand=True, resample=Image.Resampling.BICUBIC)
+            rot2 = twin_b.rotate(-math.sin(p * math.pi * 2) * 7, expand=True, resample=Image.Resampling.BICUBIC)
+            frame.paste(rot2, (int(W * 0.68 - rot2.width // 2), int(H * 0.34 - rot2.height // 2 + bob2)), rot2)
+            frame.paste(rot1, (int(W * 0.38 - rot1.width // 2), int(H * 0.50 - rot1.height // 2 + bob1)), rot1)
+
+        elif scene_style == "macro_detail":
+            ox = int((W - mw) * (0.2 + 0.6 * p))
+            oy = int((H - mh) * (0.25 + 0.5 * p))
+            frame.paste(macro, (ox, oy), macro)
+            streak = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            sx = int(-W * 0.3 + p * W * 1.6)
+            ImageDraw.Draw(streak).polygon([(sx, 0), (sx + 90, 0), (sx - H // 2 + 90, H), (sx - H // 2, H)], fill=(255, 255, 255, 34))
+            frame = Image.alpha_composite(frame, streak.filter(ImageFilter.GaussianBlur(14)))
+
+        elif scene_style == "chrome_finale":
+            sc = 0.96 + 0.08 * p
+            hp = hero.resize((int(pw * sc), int(ph * sc)), Image.Resampling.BILINEAR)
+            frame.paste(hp, (W // 2 - hp.width // 2, H // 2 - hp.height // 2), hp)
+            sd = ImageDraw.Draw(frame)
+            for ang, rad, sz, spd in sparks:
+                a = ang + p * spd * 3.2
+                cx = int(W // 2 + math.cos(a) * rad)
+                cy = int(H // 2 + math.sin(a) * rad * 0.65)
+                sd.polygon([(cx, cy - sz), (cx + sz, cy), (cx, cy + sz), (cx - sz, cy)], fill=(226, 232, 240, 210))
+
+        else:  # shatter_reveal
+            ease = 1.0 - (1.0 - min(1.0, p / 0.55)) ** 3
+            hx, hy = W // 2 - pw // 2, int(H * 0.48 - ph // 2 + math.sin(p * 6) * 8)
+            if p < 0.55:
+                for piece, x0, y0, dx, dy in tiles:
+                    frame.paste(piece, (int(hx + x0 + dx * (1 - ease)), int(hy + y0 + dy * (1 - ease))), piece)
+            else:
+                sc = 1.0 + (p - 0.55) * 0.18
+                hp = hero.resize((int(pw * sc), int(ph * sc)), Image.Resampling.BILINEAR)
+                frame.paste(hp, (W // 2 - hp.width // 2, int(H * 0.48 - hp.height // 2)), hp)
+            fd = ImageDraw.Draw(frame)
+            for fx, fy, fsz, fspd in frags:
+                ny = int((fy - p * 120 * fspd) % H)
+                fd.polygon([(fx, ny), (fx + fsz, ny + fsz // 2), (fx + fsz // 3, ny + fsz)], fill=(56, 189, 248, 150))
+
+        proc.stdin.write(frame.convert("RGB").tobytes())
+
+    proc.stdin.close()
+    err = proc.stderr.read().decode(errors="ignore")
+    if proc.wait() != 0:
+        raise RuntimeError("FFmpeg clip render failed: " + err[-250:])
 
 def build_luxury_commercial(
     job_dir: Path,
