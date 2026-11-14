@@ -14,13 +14,12 @@ from pathlib import Path
 
 import edge_tts
 import httpx
-import numpy as np
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from google import genai
 from google.genai import types
 from gtts import gTTS
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFont
 
 app = FastAPI(title="AI TV Commercial Ad Studio")
 
@@ -32,6 +31,35 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip().strip('"').strip("
 FAL_KEY = os.environ.get("FAL_KEY", "").strip().strip('"').strip("'")
 FAL_VIDEO_MODEL = os.environ.get("FAL_VIDEO_MODEL", "fal-ai/wan/v2.2-a14b/image-to-video").strip()
 USE_GEMINI_OMNI = os.environ.get("USE_GEMINI_OMNI", "false").lower() in ("1", "true", "yes")
+
+
+def save_job(job_id: str, **updates):
+    if job_id not in JOBS:
+        JOBS[job_id] = {}
+    JOBS[job_id].update(updates)
+    status_file = WORK_DIR / job_id / "status.json"
+    if status_file.parent.exists():
+        try:
+            status_file.write_text(json.dumps(JOBS[job_id]), encoding="utf-8")
+        except Exception:
+            pass
+
+
+def load_job(job_id: str) -> dict | None:
+    if job_id in JOBS:
+        return JOBS[job_id]
+    status_file = WORK_DIR / job_id / "status.json"
+    if status_file.exists():
+        try:
+            data = json.loads(status_file.read_text(encoding="utf-8"))
+            JOBS[job_id] = data
+            return data
+        except Exception:
+            pass
+    final_mp4 = WORK_DIR / job_id / "final_ad.mp4"
+    if final_mp4.exists():
+        return {"status": "done", "progress": 100, "step": "Your Commercial Ad is ready!", "video_url": f"/download/{job_id}"}
+    return None
 
 
 def get_duration(file_path: Path) -> float:
@@ -60,30 +88,29 @@ def _fallback_commercial_plan(image_path: Path, user_hint: str) -> dict:
     return {
         "brand_name": brand[:16],
         "headline_top": "NEXT-GEN POWER",
-        "headline_bottom": "PURE PERFECTION",
-        "signposts": ["Pro Quality", "Smart Design", "Built To Last"],
+        "headline_bottom": "BUILT TO WIN",
+        "signposts": ["Pro Quality", "Smart Design", "Built Strong"],
         "voiceover_script": (
             f"Looking for something truly unstoppable? Meet the all-new {brand}! "
-            f"Designed for {hint_clean}, it brings together pro quality, smart design, and unmatched performance. "
+            f"Engineered for {hint_clean}, it brings together pro quality, smart design, and unmatched performance. "
             f"Upgrade your everyday — grab your {brand} today!"
         ),
         "scene_prompts": [
             (
-                f"Photorealistic TV commercial frame: A warm sunlit modern home lifestyle scene where a smiling person "
-                f"is happily holding and looking at the EXACT product from the reference image. Keep the product's branding, "
-                f"shape, and colors 100% identical. Shallow depth of field, cinematic warm commercial lighting, no text overlays."
+                f"Photorealistic TV commercial frame: Warm sunlit modern lifestyle scene where happy real people "
+                f"are actively using and admiring the EXACT product from the reference image. Keep product identical, no text overlays."
             ),
             (
-                f"Photorealistic extreme macro TV commercial close-up showing the EXACT product from the reference image "
-                f"in active slow-motion use, highlighting its texture and real function. Dramatic studio rim light, rich contrast, no text."
+                f"Photorealistic extreme macro commercial close-up showing the EXACT product from the reference image "
+                f"in active slow-motion use, dramatic studio rim light, rich contrast, no text overlays."
             ),
             (
-                f"High-speed 3D CGI commercial explosion shot: dynamic glowing liquid splash, energy waves, or crisp particles "
-                f"swirling dramatically around the EXACT product from the reference image in rich studio lighting, no text."
+                f"High-speed 3D CGI commercial explosion shot: dynamic glowing particles, energy waves, or dramatic studio light streaks "
+                f"swirling around the EXACT product from the reference image, no text overlays."
             ),
             (
                 f"Clean hero TV commercial packshot: the EXACT product from the reference image standing boldly on a sleek "
-                f"warm tabletop with soft sunlight in the background, clear space at the top for headline text, ultra sharp 8k."
+                f"warm tabletop with soft sunlight in the background, clear space at the top for headline text, no text overlays."
             ),
         ],
     }
@@ -101,16 +128,16 @@ def plan_commercial_with_gemini(image_path: Path, user_hint: str) -> dict:
 You are an award-winning TV Commercial Director (like viral Kellogg's / Apple / Nike 20-second ads).
 Look carefully at the exact product in the uploaded image and the user's note: "{user_hint or 'Make a high-converting 3D cinematic TV commercial in English'}".
 
-Design a 4-scene commercial following this exact structure:
-- Scene 1 (Lifestyle Hook): Real people in a natural warm setting excitedly interacting with THIS EXACT product.
-- Scene 2 (Hero Action Macro): Close-up slow-motion shot demonstrating THIS EXACT product's main function in action.
-- Scene 3 (3D CGI Splash/Energy): Dramatic 3D CGI slow-motion splash/particles/dynamic elements swirling around THIS EXACT product.
+Design a 4-scene commercial:
+- Scene 1 (Lifestyle Hook): Real people naturally excited and using THIS EXACT product.
+- Scene 2 (Hero Action Macro): Close-up shot demonstrating THIS EXACT product's main function in action.
+- Scene 3 (3D CGI Splash/Energy): Dramatic 3D CGI slow-motion splash/particles/energy swirling around THIS EXACT product.
 - Scene 4 (Final Packshot): Clean tabletop product packshot with space at top for bold headline text.
 
 Also provide:
-- 3 ultra-short punchy signpost callout labels (2 words max each, like "High Protein", "High Fibre", "No Maida" — tailored to THIS product's real benefits!).
+- 3 ultra-short punchy signpost callout labels (2 words max each, like "High Protein", "High Fibre", "No Maida" — tailored to THIS product!).
 - A bold 2-line packshot headline (`headline_top` and `headline_bottom`, 2-3 words each).
-- An energetic, persuasive ENGLISH commercial voiceover script (35-45 words, ~15 seconds spoken).
+- An energetic, persuasive ENGLISH commercial voiceover script (35-45 words).
 
 Return ONLY valid JSON:
 {{
@@ -164,12 +191,6 @@ async def create_english_voiceover(text: str, out_mp3: Path, voice_accent: str):
 
 
 def generate_scene_keyframe(ref_image: Image.Image, prompt: str, aspect_ratio: str, out_png: Path) -> Path:
-    """
-    Places the EXACT uploaded product into a photorealistic commercial scene using:
-    1) Gemini Nano Banana (gemini-3.1-flash-image-preview / gemini-2.5-flash-image)
-    2) Fal.ai FLUX.1 Kontext [pro] (if FAL_KEY is set)
-    Falls back to cropped reference image if both are unavailable.
-    """
     if GEMINI_API_KEY:
         client = genai.Client(api_key=GEMINI_API_KEY)
         for img_model in ("gemini-3.1-flash-image-preview", "gemini-2.5-flash-image"):
@@ -219,9 +240,8 @@ def generate_scene_keyframe(ref_image: Image.Image, prompt: str, aspect_ratio: s
         except Exception as e:
             print(f"Fal Kontext failed: {repr(e)}", flush=True)
 
-    # Clean fallback resize of original product image
-    W, H = (720, 1280) if aspect_ratio == "9:16" else (1280, 720)
-    bg = Image.new("RGB", (W, H), (18, 22, 32))
+    W, H = (540, 960) if aspect_ratio == "9:16" else (960, 540)
+    bg = Image.new("RGB", (W, H), (14, 18, 28))
     prod = ref_image.copy()
     prod.thumbnail((W, H), Image.Resampling.LANCZOS)
     bg.paste(prod, ((W - prod.width) // 2, (H - prod.height) // 2))
@@ -230,7 +250,6 @@ def generate_scene_keyframe(ref_image: Image.Image, prompt: str, aspect_ratio: s
 
 
 def animate_keyframe_with_ai_video(keyframe_png: Path, motion_prompt: str, aspect_ratio: str, out_mp4: Path) -> bool:
-    """Animates a commercial keyframe into real moving video via Fal Wan 2.2 or Gemini Omni."""
     if FAL_KEY:
         try:
             data_uri = "data:image/png;base64," + base64.b64encode(keyframe_png.read_bytes()).decode("utf-8")
@@ -288,125 +307,89 @@ def animate_keyframe_with_ai_video(keyframe_png: Path, motion_prompt: str, aspec
     return False
 
 
-def animate_keyframe_cinematic_hd(keyframe_png: Path, mode: str, aspect_ratio: str, duration_sec: float, out_mp4: Path):
-    """Smooth HD 60fps-style Ken Burns camera motion on photorealistic AI-generated commercial frames."""
-    W, H = (720, 1280) if aspect_ratio == "9:16" else (1280, 720)
+def animate_keyframe_cinematic(keyframe_png: Path, mode: str, aspect_ratio: str, duration_sec: float, out_mp4: Path):
+    """Low-RAM, sharp 540p/960p cinematic camera motion."""
+    W, H = (540, 960) if aspect_ratio == "9:16" else (960, 540)
     fps = 24
     total_frames = int(duration_sec * fps)
+
     src = Image.open(keyframe_png).convert("RGB")
-    src = src.resize((int(W * 1.18), int(H * 1.18)), Image.Resampling.LANCZOS)
+    src = src.resize((int(W * 1.16), int(H * 1.16)), Image.Resampling.LANCZOS)
     sw, sh = src.size
 
     cmd = [
         "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
         "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", str(fps), "-i", "-",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-        "-pix_fmt", "yuv420p", "-threads", "2", str(out_mp4),
+        "-c:v", "libx264", "-preset", "superfast", "-tune", "zerolatency", "-crf", "20",
+        "-pix_fmt", "yuv420p", "-threads", "1", str(out_mp4),
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
     for f in range(total_frames):
         p = f / max(1, total_frames - 1)
         if mode == "zoom_in":
-            scale = 1.0 + 0.14 * p
+            scale = 1.0 + 0.13 * p
             ox = int((sw - W / scale) * 0.5)
             oy = int((sh - H / scale) * 0.5)
         elif mode == "pan_right":
-            scale = 1.10
-            ox = int((sw - W / scale) * (0.2 + 0.6 * p))
+            scale = 1.08
+            ox = int((sw - W / scale) * (0.15 + 0.7 * p))
             oy = int((sh - H / scale) * 0.5)
         elif mode == "dramatic_push":
-            scale = 1.02 + 0.16 * (p ** 0.8)
-            ox = int((sw - W / scale) * (0.5 + 0.06 * math.sin(p * math.pi * 2)))
+            scale = 1.02 + 0.14 * (p ** 0.85)
+            ox = int((sw - W / scale) * (0.5 + 0.05 * math.sin(p * math.pi * 2)))
             oy = int((sh - H / scale) * 0.48)
-        else:  # gentle_settle
-            scale = 1.12 - 0.10 * p
+        else:
+            scale = 1.11 - 0.09 * p
             ox = int((sw - W / scale) * 0.5)
             oy = int((sh - H / scale) * 0.5)
 
         cw, ch = int(W / scale), int(H / scale)
         ox = max(0, min(sw - cw, ox))
         oy = max(0, min(sh - ch, oy))
-        frame = src.crop((ox, oy, ox + cw, oy + ch)).resize((W, H), Image.Resampling.LANCZOS)
+        frame = src.crop((ox, oy, ox + cw, oy + ch)).resize((W, H), Image.Resampling.BILINEAR)
         proc.stdin.write(frame.tobytes())
 
     proc.stdin.close()
     err = proc.stderr.read().decode(errors="ignore")
+    src.close()
+    del src
+    gc.collect()
     if proc.wait() != 0:
         raise RuntimeError("FFmpeg render failed: " + err[-250:])
 
 
-def _create_signpost_overlay(W: int, H: int, labels: list[str], out_mov: Path, duration_sec: float):
-    """Creates transparent animated Kellogg's-style stick signpost popups (Benefit 1, 2, 3)."""
-    fps = 24
-    total_frames = int(duration_sec * fps)
-    font = _load_font(34 if W < H else 38)
+def _make_signpost_png(label: str, angle: float, out_png: Path) -> tuple[int, int]:
+    """Creates a lightweight static transparent signpost PNG (zero RAM overhead)."""
+    font = _load_font(26)
+    words = label.strip().split()
+    line1 = words[0] if words else "PRO"
+    line2 = " ".join(words[1:]) if len(words) > 1 else ""
+    bw, bh = 185, 110 if line2 else 74
 
-    # Pre-render the 3 tilted signpost boards
-    boards = []
-    positions = [
-        (int(W * 0.24), int(H * 0.52), -6),
-        (int(W * 0.72), int(H * 0.38), 5),
-        (int(W * 0.48), int(H * 0.45), -4),
-    ]
-    for label in labels[:3]:
-        words = label.strip().split()
-        line1 = words[0] if words else "PRO"
-        line2 = " ".join(words[1:]) if len(words) > 1 else ""
-        bw, bh = 240, 145 if line2 else 95
-        card = Image.new("RGBA", (bw, bh + 180), (0, 0, 0, 0))
-        d = ImageDraw.Draw(card)
-        # Wooden stick
-        d.rectangle([bw // 2 - 7, bh - 4, bw // 2 + 7, bh + 175], fill=(203, 166, 134, 255), outline=(92, 61, 46, 255), width=2)
-        # Cream signpost board
-        d.rounded_rectangle([4, 4, bw - 4, bh - 4], radius=16, fill=(255, 251, 240, 255), outline=(74, 44, 28, 255), width=5)
-        if line2:
-            w1 = d.textlength(line1, font=font)
-            w2 = d.textlength(line2, font=font)
-            d.text((bw // 2 - w1 // 2, 18), line1, font=font, fill=(60, 32, 18, 255))
-            d.text((bw // 2 - w2 // 2, 64), line2, font=font, fill=(60, 32, 18, 255))
-        else:
-            w1 = d.textlength(line1, font=font)
-            d.text((bw // 2 - w1 // 2, 26), line1, font=font, fill=(60, 32, 18, 255))
-        boards.append(card)
+    card = Image.new("RGBA", (bw, bh + 125), (0, 0, 0, 0))
+    d = ImageDraw.Draw(card)
+    d.rectangle([bw // 2 - 5, bh - 3, bw // 2 + 5, bh + 120], fill=(203, 166, 134, 255), outline=(92, 61, 46, 255), width=2)
+    d.rounded_rectangle([3, 3, bw - 3, bh - 3], radius=12, fill=(255, 251, 240, 255), outline=(74, 44, 28, 255), width=4)
 
-    cmd = [
-        "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
-        "-pix_fmt", "rgba", "-s", f"{W}x{H}", "-r", str(fps), "-i", "-",
-        "-c:v", "png", "-pix_fmt", "rgba", str(out_mov),
-    ]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-    seg = total_frames / 3.0
+    if line2:
+        w1 = d.textlength(line1, font=font)
+        w2 = d.textlength(line2, font=font)
+        d.text((bw // 2 - w1 // 2, 14), line1, font=font, fill=(60, 32, 18, 255))
+        d.text((bw // 2 - w2 // 2, 52), line2, font=font, fill=(60, 32, 18, 255))
+    else:
+        w1 = d.textlength(line1, font=font)
+        d.text((bw // 2 - w1 // 2, 20), line1, font=font, fill=(60, 32, 18, 255))
 
-    for f in range(total_frames):
-        frame = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        idx = min(2, int(f / seg))
-        local_p = (f - idx * seg) / max(1.0, seg)
-        # Spring pop-up from below
-        pop = min(1.0, local_p / 0.22)
-        ease = 1.0 - (1.0 - pop) ** 3
-        fade = 1.0 if local_p < 0.85 else max(0.0, (1.0 - local_p) / 0.15)
-
-        bx, by, angle = positions[idx]
-        rot = boards[idx].rotate(angle, expand=True, resample=Image.Resampling.BICUBIC)
-        if fade < 1.0:
-            r, g, b, a = rot.split()
-            a = a.point(lambda v: int(v * fade))
-            rot.putalpha(a)
-
-        y_off = int((1.0 - ease) * 90)
-        frame.alpha_composite(rot, (max(0, min(W - rot.width, bx - rot.width // 2)), max(0, min(H - rot.height, by - rot.height // 2 + y_off))))
-        proc.stdin.write(frame.tobytes())
-
-    proc.stdin.close()
-    proc.wait()
+    rot = card.rotate(angle, expand=True, resample=Image.Resampling.BICUBIC)
+    rot.save(out_png, format="PNG")
+    return rot.size
 
 
 def _create_packshot_headline_png(W: int, H: int, top_line: str, bottom_line: str, out_png: Path):
-    """Creates slanted bold Yellow + White TV-commercial packshot headline."""
     banner = Image.new("RGBA", (W, int(H * 0.34)), (0, 0, 0, 0))
-    f_top = _load_font(54 if W < H else 62)
-    f_bot = _load_font(52 if W < H else 60)
+    f_top = _load_font(40 if W < H else 48)
+    f_bot = _load_font(38 if W < H else 46)
 
     txt_layer = Image.new("RGBA", (W, int(H * 0.32)), (0, 0, 0, 0))
     d = ImageDraw.Draw(txt_layer)
@@ -415,18 +398,16 @@ def _create_packshot_headline_png(W: int, H: int, top_line: str, bottom_line: st
 
     w1 = d.textlength(t1, font=f_top)
     w2 = d.textlength(t2, font=f_bot)
-    y1, y2 = 46, 118
+    y1, y2 = 34, 88
 
-    # Drop shadow + Yellow line 1
-    d.text((W // 2 - w1 // 2 + 4, y1 + 5), t1, font=f_top, fill=(0, 0, 0, 170))
+    d.text((W // 2 - w1 // 2 + 3, y1 + 4), t1, font=f_top, fill=(0, 0, 0, 175))
     d.text((W // 2 - w1 // 2, y1), t1, font=f_top, fill=(250, 204, 21, 255))
 
-    # Drop shadow + White line 2
-    d.text((W // 2 - w2 // 2 + 4, y2 + 5), t2, font=f_bot, fill=(0, 0, 0, 170))
+    d.text((W // 2 - w2 // 2 + 3, y2 + 4), t2, font=f_bot, fill=(0, 0, 0, 175))
     d.text((W // 2 - w2 // 2, y2), t2, font=f_bot, fill=(255, 255, 255, 255))
 
     tilted = txt_layer.rotate(5, expand=False, resample=Image.Resampling.BICUBIC)
-    banner.alpha_composite(tilted, (0, 10))
+    banner.alpha_composite(tilted, (0, 8))
     banner.save(out_png, format="PNG")
 
 
@@ -437,63 +418,91 @@ def assemble_commercial(
     plan: dict,
     aspect_ratio: str,
 ) -> Path:
-    W, H = (720, 1280) if aspect_ratio == "9:16" else (1280, 720)
+    W, H = (540, 960) if aspect_ratio == "9:16" else (960, 540)
 
-    # 1) Create Signpost Pop-up overlay on Scene 3 (index 2)
-    s3_dur = get_duration(scene_videos[2])
-    signpost_mov = job_dir / "signposts.mov"
-    _create_signpost_overlay(W, H, plan.get("signposts", ["Pro Quality", "Smart Design", "Built Strong"]), signpost_mov, s3_dur)
-
-    s3_with_signs = job_dir / "scene3_signed.mp4"
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-i", str(scene_videos[2]), "-i", str(signpost_mov),
-            "-filter_complex", "[0:v][1:v]overlay=0:0:shortest=1[v]",
-            "-map", "[v]", "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-            "-pix_fmt", "yuv420p", str(s3_with_signs),
-        ],
-        check=True,
-    )
-    scene_videos[2].unlink(missing_ok=True)
-    signpost_mov.unlink(missing_ok=True)
-    scene_videos[2] = s3_with_signs
-
-    # 2) Create Slanted Packshot Headline overlay on Scene 4 (index 3)
-    headline_png = job_dir / "headline.png"
-    _create_packshot_headline_png(W, H, plan.get("headline_top", "PURE ENERGY"), plan.get("headline_bottom", "BUILT TO LAST"), headline_png)
-    s4_with_head = job_dir / "scene4_headline.mp4"
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-i", str(scene_videos[3]), "-i", str(headline_png),
-            "-filter_complex", "[0:v][1:v]overlay=0:25[v]",
-            "-map", "[v]", "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-            "-pix_fmt", "yuv420p", str(s4_with_head),
-        ],
-        check=True,
-    )
-    scene_videos[3].unlink(missing_ok=True)
-    headline_png.unlink(missing_ok=True)
-    scene_videos[3] = s4_with_head
-
-    # 3) Normalize & concat all 4 scenes cleanly
+    # 1) Normalize Scene 1 & 2 cleanly (low RAM, 1 thread)
     norm_clips = []
-    for i, sc in enumerate(scene_videos):
-        norm = job_dir / f"norm_{i}.mp4"
+    for idx in range(4):
+        sc = scene_videos[idx]
+        norm = job_dir / f"norm_{idx}.mp4"
         dur = get_duration(sc)
         out_st = max(0.4, dur - 0.16)
-        vf = (
+        base_vf = (
             f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps=24,"
             f"eq=contrast=1.05:saturation=1.08,fade=t=in:st=0:d=0.14,fade=t=out:st={out_st:.2f}:d=0.14"
         )
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-i", str(sc), "-vf", vf, "-an",
-                "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p", str(norm),
-            ],
-            check=True,
-        )
+
+        if idx == 2:
+            # Overlay 3 lightweight static signpost PNGs directly in FFmpeg!
+            labels = plan.get("signposts", ["Pro Quality", "Smart Design", "Built Strong"])[:3]
+            angles = (-6, 5, -4)
+            sign_paths = []
+            sign_sizes = []
+            for s_i, lbl in enumerate(labels):
+                sp = job_dir / f"sign_{s_i}.png"
+                sz = _make_signpost_png(lbl, angles[s_i], sp)
+                sign_paths.append(sp)
+                sign_sizes.append(sz)
+
+            seg = dur / 3.0
+            t_bounds = [(0.05, seg), (seg, seg * 2), (seg * 2, dur)]
+            coords = [
+                (int(W * 0.08), int(H * 0.36)),
+                (max(12, W - sign_sizes[1][0] - int(W * 0.08)), int(H * 0.25)),
+                ((W - sign_sizes[2][0]) // 2, int(H * 0.33)),
+            ]
+            fc = (
+                f"[0:v]{base_vf}[b0];"
+                f"[b0][1:v]overlay=x={coords[0][0]}:y='{coords[0][1]}+70*max(0\\,1-(t-{t_bounds[0][0]:.2f})/0.22)':enable='between(t\\,{t_bounds[0][0]:.2f}\\,{t_bounds[0][1]:.2f})'[b1];"
+                f"[b1][2:v]overlay=x={coords[1][0]}:y='{coords[1][1]}+70*max(0\\,1-(t-{t_bounds[1][0]:.2f})/0.22)':enable='between(t\\,{t_bounds[1][0]:.2f}\\,{t_bounds[1][1]:.2f})'[b2];"
+                f"[b2][3:v]overlay=x={coords[2][0]}:y='{coords[2][1]}+70*max(0\\,1-(t-{t_bounds[2][0]:.2f})/0.22)':enable='between(t\\,{t_bounds[2][0]:.2f}\\,{t_bounds[2][1]:.2f})'[v]"
+            )
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", str(sc),
+                    "-i", str(sign_paths[0]), "-i", str(sign_paths[1]), "-i", str(sign_paths[2]),
+                    "-filter_complex", fc, "-map", "[v]", "-an",
+                    "-c:v", "libx264", "-preset", "superfast", "-tune", "zerolatency", "-crf", "20",
+                    "-pix_fmt", "yuv420p", "-threads", "1", str(norm),
+                ],
+                check=True,
+            )
+            for sp in sign_paths:
+                sp.unlink(missing_ok=True)
+
+        elif idx == 3:
+            headline_png = job_dir / "headline.png"
+            _create_packshot_headline_png(
+                W, H,
+                plan.get("headline_top", "PURE ENERGY"),
+                plan.get("headline_bottom", "BUILT TO WIN"),
+                headline_png,
+            )
+            fc = f"[0:v]{base_vf}[b0];[b0][1:v]overlay=0:18[v]"
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", str(sc), "-i", str(headline_png),
+                    "-filter_complex", fc, "-map", "[v]", "-an",
+                    "-c:v", "libx264", "-preset", "superfast", "-tune", "zerolatency", "-crf", "20",
+                    "-pix_fmt", "yuv420p", "-threads", "1", str(norm),
+                ],
+                check=True,
+            )
+            headline_png.unlink(missing_ok=True)
+
+        else:
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", str(sc), "-vf", base_vf, "-an",
+                    "-c:v", "libx264", "-preset", "superfast", "-tune", "zerolatency", "-crf", "20",
+                    "-pix_fmt", "yuv420p", "-threads", "1", str(norm),
+                ],
+                check=True,
+            )
+
         sc.unlink(missing_ok=True)
         norm_clips.append(norm)
+        gc.collect()
 
     merged_video = job_dir / "merged.mp4"
     concat_txt = job_dir / "concat.txt"
@@ -505,7 +514,6 @@ def assemble_commercial(
     for c in norm_clips:
         c.unlink(missing_ok=True)
 
-    # 4) Mix crisp English Voiceover + Energetic Commercial Pulse Beat
     vid_dur = get_duration(merged_video)
     aud_dur = get_duration(voice_mp3)
     target_dur = max(vid_dur, aud_dur + 0.6)
@@ -524,9 +532,9 @@ def assemble_commercial(
             "ffmpeg", "-y", "-i", str(merged_video), "-i", str(voice_mp3),
             "-filter_complex", f"{video_filter};{audio_filter}",
             "-map", "[vfinal]", "-map", "[aout]",
-            "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k", "-t", f"{target_dur:.2f}",
-            "-movflags", "+faststart", "-threads", "2", str(final_mp4),
+            "-c:v", "libx264", "-preset", "superfast", "-tune", "zerolatency", "-crf", "20", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k", "-t", f"{target_dur:.2f}",
+            "-movflags", "+faststart", "-threads", "1", str(final_mp4),
         ],
         check=True,
     )
@@ -538,53 +546,53 @@ def assemble_commercial(
 def run_pipeline(job_id: str, image_path: Path, hint: str, voice_accent: str, aspect_ratio: str):
     job_dir = image_path.parent
     try:
-        JOBS[job_id]["step"] = "Planning 4-scene TV commercial & English script..."
-        JOBS[job_id]["progress"] = 10
+        save_job(job_id, step="Planning 4-scene TV commercial & English script...", progress=10)
         plan = plan_commercial_with_gemini(image_path, hint)
-        JOBS[job_id]["script"] = plan["voiceover_script"]
+        save_job(job_id, script=plan["voiceover_script"])
 
-        JOBS[job_id]["step"] = "Recording energetic English commercial voiceover..."
-        JOBS[job_id]["progress"] = 20
+        save_job(job_id, step="Recording energetic English commercial voiceover...", progress=20)
         voice_mp3 = job_dir / "voice.mp3"
         asyncio.run(create_english_voiceover(plan["voiceover_script"], voice_mp3, voice_accent))
 
         ref_img = Image.open(image_path).convert("RGB")
-        ref_img.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
+        ref_img.thumbnail((800, 800), Image.Resampling.LANCZOS)
 
         scene_prompts = plan["scene_prompts"][:4]
         motion_modes = [("zoom_in", 4.5), ("pan_right", 3.8), ("dramatic_push", 5.2), ("gentle_settle", 3.5)]
         scene_videos = []
 
         for idx, sc_prompt in enumerate(scene_prompts):
-            JOBS[job_id]["step"] = f"Generating AI Commercial Scene {idx + 1}/4..."
-            JOBS[job_id]["progress"] = 28 + idx * 14
+            save_job(job_id, step=f"Generating AI Commercial Scene {idx + 1}/4...", progress=28 + idx * 14)
             kf_png = job_dir / f"keyframe_{idx}.png"
             generate_scene_keyframe(ref_img, sc_prompt, aspect_ratio, kf_png)
 
             sc_mp4 = job_dir / f"scene_{idx}.mp4"
-            JOBS[job_id]["step"] = f"Animating Scene {idx + 1}/4 into cinematic motion..."
+            save_job(job_id, step=f"Animating Scene {idx + 1}/4...", progress=34 + idx * 14)
             mode, dur = motion_modes[idx]
             if not animate_keyframe_with_ai_video(kf_png, sc_prompt, aspect_ratio, sc_mp4):
-                animate_keyframe_cinematic_hd(kf_png, mode, aspect_ratio, dur, sc_mp4)
+                animate_keyframe_cinematic(kf_png, mode, aspect_ratio, dur, sc_mp4)
 
             kf_png.unlink(missing_ok=True)
             scene_videos.append(sc_mp4)
+            gc.collect()
 
+        ref_img.close()
         del ref_img
         gc.collect()
 
-        JOBS[job_id]["step"] = "Adding Signpost Callouts, Packshot Headline & English Voiceover..."
-        JOBS[job_id]["progress"] = 90
+        save_job(job_id, step="Adding Signpost Callouts, Packshot Headline & English Voiceover...", progress=90)
         assemble_commercial(job_dir, scene_videos, voice_mp3, plan, aspect_ratio)
 
-        JOBS[job_id].update({
-            "status": "done",
-            "progress": 100,
-            "step": "Your TV-style 3D Commercial Ad is ready!",
-            "video_url": f"/download/{job_id}",
-        })
+        save_job(
+            job_id,
+            status="done",
+            progress=100,
+            step="Your TV-style 3D Commercial Ad is ready!",
+            video_url=f"/download/{job_id}",
+        )
     except Exception as exc:
-        JOBS[job_id].update({"status": "error", "step": f"Error: {str(exc)}"})
+        print(f"Pipeline error ({job_id}): {repr(exc)}", flush=True)
+        save_job(job_id, status="error", step=f"Error: {str(exc)}")
 
 
 @app.get("/healthz")
@@ -617,7 +625,7 @@ async def generate_ad(
     with open(img_path, "wb") as f:
         shutil.copyfileobj(image.file, f)
 
-    JOBS[job_id] = {"status": "processing", "progress": 5, "step": "Starting...", "script": ""}
+    save_job(job_id, status="processing", progress=5, step="Starting...", script="")
     threading.Thread(
         target=run_pipeline,
         args=(job_id, img_path, hint, voice_accent, aspect_ratio),
@@ -628,9 +636,10 @@ async def generate_ad(
 
 @app.get("/status/{job_id}")
 def get_status(job_id: str):
-    if job_id not in JOBS:
+    data = load_job(job_id)
+    if not data:
         return JSONResponse({"status": "error", "step": "Job not found"}, status_code=404)
-    return JOBS[job_id]
+    return data
 
 
 @app.get("/download/{job_id}")
