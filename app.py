@@ -97,20 +97,20 @@ def _fallback_commercial_plan(image_path: Path, user_hint: str) -> dict:
         ),
         "scene_prompts": [
             (
-                f"Photorealistic TV commercial frame: Warm sunlit modern lifestyle scene where happy real people "
-                f"are actively using and admiring the EXACT product from the reference image. Keep product identical, no text overlays."
+                "Photorealistic TV commercial frame: Warm sunlit modern home/outdoor lifestyle scene where happy real people "
+                "are actively using and admiring the EXACT product from the reference image. Keep product 100% identical, no text overlays."
             ),
             (
-                f"Photorealistic extreme macro commercial close-up showing the EXACT product from the reference image "
-                f"in active slow-motion use, dramatic studio rim light, rich contrast, no text overlays."
+                "Photorealistic extreme macro commercial close-up showing the EXACT product from the reference image "
+                "in active slow-motion use, dramatic studio rim light, rich contrast, no text overlays."
             ),
             (
-                f"High-speed 3D CGI commercial explosion shot: dynamic glowing particles, energy waves, or dramatic studio light streaks "
-                f"swirling around the EXACT product from the reference image, no text overlays."
+                "High-speed 3D CGI commercial explosion shot: dynamic glowing particles, energy waves, or crisp light streaks "
+                "swirling around the EXACT product from the reference image, no text overlays."
             ),
             (
-                f"Clean hero TV commercial packshot: the EXACT product from the reference image standing boldly on a sleek "
-                f"warm tabletop with soft sunlight in the background, clear space at the top for headline text, no text overlays."
+                "Clean hero TV commercial packshot: the EXACT product from the reference image standing boldly on a sleek "
+                "warm tabletop with soft sunlight in the background, clear space at the top for headline text, no text overlays."
             ),
         ],
     }
@@ -154,7 +154,7 @@ Return ONLY valid JSON:
   ]
 }}
 """
-    for model_name in ("gemini-2.5-flash", "gemini-3-flash-preview", "gemini-3.5-flash-lite"):
+    for model_name in ("gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3-flash-preview"):
         try:
             resp = client.models.generate_content(
                 model=model_name,
@@ -190,29 +190,14 @@ async def create_english_voiceover(text: str, out_mp3: Path, voice_accent: str):
         gTTS(text=text, lang="en", tld="com").save(str(out_mp3))
 
 
-def generate_scene_keyframe(ref_image: Image.Image, prompt: str, aspect_ratio: str, out_png: Path) -> Path:
-    if GEMINI_API_KEY:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        for img_model in ("gemini-3.1-flash-image-preview", "gemini-2.5-flash-image"):
-            try:
-                resp = client.models.generate_content(
-                    model=img_model,
-                    contents=[prompt, ref_image],
-                    config=types.GenerateContentConfig(
-                        response_modalities=["IMAGE"],
-                        image_config=types.ImageConfig(aspect_ratio=aspect_ratio),
-                    ),
-                )
-                for cand in getattr(resp, "candidates", []) or []:
-                    for part in getattr(cand.content, "parts", []) or []:
-                        if getattr(part, "inline_data", None) and part.inline_data.data:
-                            gen = Image.open(io.BytesIO(part.inline_data.data)).convert("RGB")
-                            gen.save(out_png, format="PNG")
-                            return out_png
-            except Exception as e:
-                print(f"Gemini Image ({img_model}) failed: {repr(e)}", flush=True)
-                continue
+def generate_scene_keyframe(ref_image: Image.Image, prompt: str, aspect_ratio: str, out_png: Path) -> tuple[Path, str | None]:
+    """
+    Generates an AI commercial scene containing the EXACT product.
+    Returns (path, error_reason_if_failed).
+    """
+    last_err = None
 
+    # 1) Fal.ai FLUX.1 Kontext [pro] (Best for exact product placement in new scenes)
     if FAL_KEY:
         try:
             buf = io.BytesIO()
@@ -234,11 +219,40 @@ def generate_scene_keyframe(ref_image: Image.Image, prompt: str, aspect_ratio: s
                         res = hc.get(q["response_url"], headers=headers).json()
                         img_url = res["images"][0]["url"]
                         out_png.write_bytes(hc.get(img_url).content)
-                        return out_png
+                        return out_png, None
                     if st.get("status") in ("FAILED", "CANCELLED"):
+                        last_err = f"Fal Kontext failed: {st}"
                         break
         except Exception as e:
-            print(f"Fal Kontext failed: {repr(e)}", flush=True)
+            last_err = f"Fal Kontext error: {e}"
+            print(last_err, flush=True)
+
+    # 2) Google Gemini Image Models (Requires Billing enabled in Google AI Studio)
+    if GEMINI_API_KEY:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        for img_model in ("gemini-3.1-flash-lite-image", "gemini-3.1-flash-image"):
+            try:
+                resp = client.models.generate_content(
+                    model=img_model,
+                    contents=[prompt, ref_image],
+                    config=types.GenerateContentConfig(
+                        response_modalities=["IMAGE"],
+                        image_config=types.ImageConfig(aspect_ratio=aspect_ratio),
+                    ),
+                )
+                for cand in getattr(resp, "candidates", []) or []:
+                    for part in getattr(cand.content, "parts", []) or []:
+                        if getattr(part, "inline_data", None) and part.inline_data.data:
+                            gen = Image.open(io.BytesIO(part.inline_data.data)).convert("RGB")
+                            gen.save(out_png, format="PNG")
+                            return out_png, None
+            except Exception as e:
+                last_err = str(e)
+                print(f"Gemini Image ({img_model}) failed: {repr(e)}", flush=True)
+                continue
+
+    if not last_err:
+        last_err = "Neither FAL_KEY nor paid GEMINI_API_KEY image billing is active."
 
     W, H = (540, 960) if aspect_ratio == "9:16" else (960, 540)
     bg = Image.new("RGB", (W, H), (14, 18, 28))
@@ -246,7 +260,7 @@ def generate_scene_keyframe(ref_image: Image.Image, prompt: str, aspect_ratio: s
     prod.thumbnail((W, H), Image.Resampling.LANCZOS)
     bg.paste(prod, ((W - prod.width) // 2, (H - prod.height) // 2))
     bg.save(out_png, format="PNG")
-    return out_png
+    return out_png, last_err
 
 
 def animate_keyframe_with_ai_video(keyframe_png: Path, motion_prompt: str, aspect_ratio: str, out_mp4: Path) -> bool:
@@ -308,7 +322,6 @@ def animate_keyframe_with_ai_video(keyframe_png: Path, motion_prompt: str, aspec
 
 
 def animate_keyframe_cinematic(keyframe_png: Path, mode: str, aspect_ratio: str, duration_sec: float, out_mp4: Path):
-    """Low-RAM, sharp 540p/960p cinematic camera motion."""
     W, H = (540, 960) if aspect_ratio == "9:16" else (960, 540)
     fps = 24
     total_frames = int(duration_sec * fps)
@@ -360,7 +373,6 @@ def animate_keyframe_cinematic(keyframe_png: Path, mode: str, aspect_ratio: str,
 
 
 def _make_signpost_png(label: str, angle: float, out_png: Path) -> tuple[int, int]:
-    """Creates a lightweight static transparent signpost PNG (zero RAM overhead)."""
     font = _load_font(26)
     words = label.strip().split()
     line1 = words[0] if words else "PRO"
@@ -419,9 +431,8 @@ def assemble_commercial(
     aspect_ratio: str,
 ) -> Path:
     W, H = (540, 960) if aspect_ratio == "9:16" else (960, 540)
-
-    # 1) Normalize Scene 1 & 2 cleanly (low RAM, 1 thread)
     norm_clips = []
+
     for idx in range(4):
         sc = scene_videos[idx]
         norm = job_dir / f"norm_{idx}.mp4"
@@ -433,16 +444,13 @@ def assemble_commercial(
         )
 
         if idx == 2:
-            # Overlay 3 lightweight static signpost PNGs directly in FFmpeg!
             labels = plan.get("signposts", ["Pro Quality", "Smart Design", "Built Strong"])[:3]
             angles = (-6, 5, -4)
-            sign_paths = []
-            sign_sizes = []
+            sign_paths, sign_sizes = [], []
             for s_i, lbl in enumerate(labels):
                 sp = job_dir / f"sign_{s_i}.png"
-                sz = _make_signpost_png(lbl, angles[s_i], sp)
+                sign_sizes.append(_make_signpost_png(lbl, angles[s_i], sp))
                 sign_paths.append(sp)
-                sign_sizes.append(sz)
 
             seg = dur / 3.0
             t_bounds = [(0.05, seg), (seg, seg * 2), (seg * 2, dur)]
@@ -550,7 +558,7 @@ def run_pipeline(job_id: str, image_path: Path, hint: str, voice_accent: str, as
         plan = plan_commercial_with_gemini(image_path, hint)
         save_job(job_id, script=plan["voiceover_script"])
 
-        save_job(job_id, step="Recording energetic English commercial voiceover...", progress=20)
+        save_job(job_id, step="Recording English commercial voiceover...", progress=20)
         voice_mp3 = job_dir / "voice.mp3"
         asyncio.run(create_english_voiceover(plan["voiceover_script"], voice_mp3, voice_accent))
 
@@ -560,11 +568,18 @@ def run_pipeline(job_id: str, image_path: Path, hint: str, voice_accent: str, as
         scene_prompts = plan["scene_prompts"][:4]
         motion_modes = [("zoom_in", 4.5), ("pan_right", 3.8), ("dramatic_push", 5.2), ("gentle_settle", 3.5)]
         scene_videos = []
+        scene_warning = None
 
         for idx, sc_prompt in enumerate(scene_prompts):
             save_job(job_id, step=f"Generating AI Commercial Scene {idx + 1}/4...", progress=28 + idx * 14)
             kf_png = job_dir / f"keyframe_{idx}.png"
-            generate_scene_keyframe(ref_img, sc_prompt, aspect_ratio, kf_png)
+            _, err_msg = generate_scene_keyframe(ref_img, sc_prompt, aspect_ratio, kf_png)
+            if err_msg and not scene_warning:
+                scene_warning = (
+                    "⚠️ AI Scene Generation failed (Gemini Free Tier has quota=0 for Image/Video). "
+                    "Add FAL_KEY or enable Google AI Studio Billing for real Kellogg's-style scenes! "
+                    f"Details: {err_msg[:160]}"
+                )
 
             sc_mp4 = job_dir / f"scene_{idx}.mp4"
             save_job(job_id, step=f"Animating Scene {idx + 1}/4...", progress=34 + idx * 14)
@@ -587,7 +602,8 @@ def run_pipeline(job_id: str, image_path: Path, hint: str, voice_accent: str, as
             job_id,
             status="done",
             progress=100,
-            step="Your TV-style 3D Commercial Ad is ready!",
+            step="Your Commercial Ad is ready!",
+            warning=scene_warning or "",
             video_url=f"/download/{job_id}",
         )
     except Exception as exc:
@@ -625,7 +641,7 @@ async def generate_ad(
     with open(img_path, "wb") as f:
         shutil.copyfileobj(image.file, f)
 
-    save_job(job_id, status="processing", progress=5, step="Starting...", script="")
+    save_job(job_id, status="processing", progress=5, step="Starting...", script="", warning="")
     threading.Thread(
         target=run_pipeline,
         args=(job_id, img_path, hint, voice_accent, aspect_ratio),
@@ -656,7 +672,7 @@ def home():
     badge = (
         '<span style="color:#10b981;font-weight:700;">● Full AI Video Motion + Scene Generation Active</span>'
         if video_ai
-        else '<span style="color:#38bdf8;font-weight:700;">● Gemini AI Scene Staging + Cinematic Motion Active (Add FAL_KEY for full AI video motion)</span>'
+        else '<span style="color:#f59e0b;font-weight:700;">● Warning: Add FAL_KEY or Enable Gemini Paid Billing for Real AI Scenes & Motion</span>'
     )
     return f"""
 <!DOCTYPE html>
@@ -676,6 +692,7 @@ def home():
     .progress-box {{ display: none; margin-top: 20px; background: #0b1120; padding: 14px; border-radius: 10px; }}
     .bar-bg {{ width: 100%; height: 10px; background: #1e293b; border-radius: 99px; overflow: hidden; margin-top: 8px; }}
     .bar-fill {{ height: 100%; width: 0%; background: #facc15; transition: width 0.4s; }}
+    .warn-box {{ display: none; margin-top: 12px; padding: 10px; border-radius: 8px; background: #451a03; border: 1px solid #f59e0b; color: #fde68a; font-size: 0.85rem; }}
     video {{ width: 100%; max-height: 540px; border-radius: 12px; margin-top: 16px; background: #000; }}
     .dl-btn {{ display: inline-block; margin-top: 12px; padding: 10px 18px; background: #10b981; color: #fff; text-decoration: none; border-radius: 8px; font-weight: 600; }}
   </style>
@@ -684,13 +701,13 @@ def home():
   <div class="card">
     <h1>🎬 AI TV-Style Product Commercial Studio</h1>
     <p style="font-size:0.85rem;margin-top:-6px;">{badge}</p>
-    <p style="color:#94a3b8;font-size:0.9rem;">Upload your product photo. AI generates a 4-scene lifestyle + 3D CGI splash commercial with pop-up benefit signposts, slanted packshot headline & English voiceover.</p>
+    <p style="color:#94a3b8;font-size:0.9rem;">Upload a single clear product photo. AI generates a 4-scene lifestyle + 3D CGI splash commercial with pop-up benefit signposts, slanted packshot headline & English voiceover.</p>
     <form id="adForm">
-      <label>1. Upload Product Photo</label>
+      <label>1. Upload Single Product Photo</label>
       <input type="file" name="image" accept="image/*" required />
 
       <label>2. Product Benefits / Ad Concept (Optional)</label>
-      <textarea name="hint" rows="2" placeholder="e.g. Chocolate multigrain snack, high protein, no maida, mom & kid breakfast vibe"></textarea>
+      <textarea name="hint" rows="2" placeholder="e.g. Badminton racket set, lightweight graphite frame, family outdoor fun"></textarea>
 
       <label>3. English Voiceover</label>
       <select name="voice_accent">
@@ -713,6 +730,7 @@ def home():
       <div id="statusText">Starting...</div>
       <div class="bar-bg"><div class="bar-fill" id="barFill"></div></div>
       <p id="scriptBox" style="font-size:0.85rem;color:#94a3b8;margin-top:10px;"></p>
+      <div class="warn-box" id="warnBox"></div>
     </div>
 
     <div id="resultBox" style="display:none;">
@@ -728,6 +746,7 @@ def home():
     const statusText = document.getElementById("statusText");
     const barFill = document.getElementById("barFill");
     const scriptBox = document.getElementById("scriptBox");
+    const warnBox = document.getElementById("warnBox");
     const resultBox = document.getElementById("resultBox");
     const adVideo = document.getElementById("adVideo");
     const dlLink = document.getElementById("dlLink");
@@ -736,6 +755,7 @@ def home():
       e.preventDefault();
       btn.disabled = true;
       resultBox.style.display = "none";
+      warnBox.style.display = "none";
       progressBox.style.display = "block";
       statusText.innerText = "Uploading product photo...";
       barFill.style.width = "5%";
@@ -750,6 +770,10 @@ def home():
         statusText.innerText = data.step || "Processing...";
         barFill.style.width = (data.progress || 10) + "%";
         if (data.script) scriptBox.innerText = "🎙️ English Voiceover: " + data.script;
+        if (data.warning) {{
+          warnBox.innerText = data.warning;
+          warnBox.style.display = "block";
+        }}
 
         if (data.status === "done") {{
           clearInterval(timer);
