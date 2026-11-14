@@ -5,7 +5,6 @@ import io
 import json
 import math
 import os
-import random
 import shutil
 import subprocess
 import threading
@@ -21,21 +20,9 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from google import genai
 from google.genai import types
 from gtts import gTTS
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-REMBG_MODEL = os.environ.get("REMBG_MODEL", "isnet-general-use")
-try:
-    from rembg import new_session, remove as rembg_remove
-    try:
-        REMBG_SESSION = new_session(REMBG_MODEL)
-    except Exception:
-        REMBG_SESSION = new_session("u2netp")
-    HAS_REMBG = True
-except Exception:
-    REMBG_SESSION = None
-    HAS_REMBG = False
-
-app = FastAPI(title="AI 3D CGI Product Ad Studio")
+app = FastAPI(title="AI TV Commercial Ad Studio")
 
 WORK_DIR = Path("/tmp/ad_jobs")
 WORK_DIR.mkdir(parents=True, exist_ok=True)
@@ -43,11 +30,7 @@ JOBS = {}
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip().strip('"').strip("'")
 FAL_KEY = os.environ.get("FAL_KEY", "").strip().strip('"').strip("'")
-FAL_MODEL = os.environ.get("FAL_VIDEO_MODEL", "fal-ai/wan/v2.2-a14b/image-to-video").strip()
-MODAL_VIDEO_URL = os.environ.get("MODAL_VIDEO_URL", "").strip().strip('"').strip("'")
-if MODAL_VIDEO_URL and not MODAL_VIDEO_URL.startswith(("http://", "https://")):
-    MODAL_VIDEO_URL = "https://" + MODAL_VIDEO_URL
-
+FAL_VIDEO_MODEL = os.environ.get("FAL_VIDEO_MODEL", "fal-ai/wan/v2.2-a14b/image-to-video").strip()
 USE_GEMINI_OMNI = os.environ.get("USE_GEMINI_OMNI", "false").lower() in ("1", "true", "yes")
 
 
@@ -59,150 +42,109 @@ def get_duration(file_path: Path) -> float:
     return float(subprocess.check_output(cmd).decode().strip())
 
 
-def _load_font(size: int, serif: bool = False) -> ImageFont.FreeTypeFont:
-    candidates = (
-        ["/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]
-        if serif
-        else ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]
-    )
-    for path in candidates:
+def _load_font(size: int) -> ImageFont.FreeTypeFont:
+    for path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ):
         if Path(path).exists():
             return ImageFont.truetype(path, size)
     return ImageFont.load_default()
 
 
-def extract_product_hd(image_bytes: bytes) -> Image.Image:
-    """Extracts ONLY the product cleanly at high resolution (no background clutter)."""
-    orig = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
-    orig.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
-
-    if HAS_REMBG:
-        try:
-            buf = io.BytesIO()
-            orig.save(buf, format="PNG")
-            cutout_bytes = rembg_remove(buf.getvalue(), session=REMBG_SESSION)
-            img = Image.open(io.BytesIO(cutout_bytes)).convert("RGBA")
-            bbox = img.getbbox()
-            if bbox:
-                img = img.crop(bbox)
-            # Subtle 0.6px anti-alias on alpha edge to remove rough cutout stair-stepping
-            r, g, b, a = img.split()
-            a = a.filter(ImageFilter.GaussianBlur(0.6))
-            img.putalpha(a)
-            return img
-        except Exception as e:
-            print(f"rembg failed, falling back to color/edge cutout: {e}", flush=True)
-
-    arr = np.array(orig, dtype=np.float32)
-    h, w, _ = arr.shape
-    border = np.concatenate([arr[0, :, :3], arr[-1, :, :3], arr[:, 0, :3], arr[:, -1, :3]], axis=0)
-    bg_rgb = np.median(border, axis=0)
-    dist = np.linalg.norm(arr[:, :, :3] - bg_rgb, axis=2)
-
-    if float(np.mean(np.std(border, axis=0))) < 48.0:
-        alpha = np.clip((dist - 20.0) / 30.0, 0.0, 1.0) * 255.0
-        if np.mean(alpha > 128) > 0.10:
-            orig.putalpha(Image.fromarray(alpha.astype(np.uint8), "L").filter(ImageFilter.GaussianBlur(1)))
-            bbox = orig.getbbox()
-            if bbox:
-                orig = orig.crop(bbox)
-            return orig
-
-    return orig
-
-
-def _fallback_ad_plan(image_path: Path, user_hint: str) -> dict:
+def _fallback_commercial_plan(image_path: Path, user_hint: str) -> dict:
     raw = image_path.stem.replace("_", " ").replace("-", " ").strip()
-    brand = "".join(c for c in (raw.split()[0] if raw else "LUXURY") if c.isalnum()).upper() or "LUXURY"
-    hint_clean = (user_hint or "precision 3D engineering and luxury design").strip()
-
-    script = (
-        f"Stop settling for ordinary. Meet the all-new {brand}. "
-        f"Crafted with {hint_clean}, delivering unmatched precision, effortless performance, and bold luxury design. "
-        f"Elevate your everyday — order your {brand} today."
-    )
+    brand = "".join(c for c in (raw.split()[0] if raw else "PRIME") if c.isalnum()).upper() or "PRIME"
+    hint_clean = (user_hint or "everyday luxury and smart performance").strip()
 
     return {
-        "hero_brand": brand[:18],
-        "product_name": brand,
-        "tagline": "ENGINEERED TO STAND OUT",
-        "key_functions": [
-            {"title": "PRECISION BUILD", "detail": "Crafted for peak durability & luxury"},
-            {"title": "SMART PERFORMANCE", "detail": "Effortless power in every detail"},
-            {"title": "STUDIO GRADE FINISH", "detail": "Designed to turn heads everywhere"},
-        ],
-        "voiceover_script": script,
-        "cgi_prompts": [
-            f"Ultra-photorealistic 3D CGI commercial shot of this exact {brand} product levitating above a dark obsidian marble pedestal, dramatic rim lighting, floating silver light particles, slow cinematic 3D camera orbit, Unreal Engine 5 Octane render style, 8k sharp product details.",
-            f"Cinematic 3D CGI commercial close-up of this exact {brand} product in motion, dynamic volumetric spotlight sweep, subtle mist and micro-droplets in slow motion highlighting its build and function, luxury Apple/Dior commercial aesthetic.",
-            f"Hero 3D CGI luxury packshot of this exact {brand} product centered on a sleek reflective chrome surface, dramatic dark studio gradient, glowing volumetric light beams behind product, smooth push-in camera motion."
-        ],
-        "scenes": [
-            {"scene_style": "3d_orbit_reveal", "feature_idx": 0},
-            {"scene_style": "function_showcase", "feature_idx": 0},
-            {"scene_style": "macro_3d_sweep", "feature_idx": 1},
-            {"scene_style": "function_showcase", "feature_idx": 2},
-            {"scene_style": "luxury_cta_finale", "feature_idx": 2},
+        "brand_name": brand[:16],
+        "headline_top": "NEXT-GEN POWER",
+        "headline_bottom": "PURE PERFECTION",
+        "signposts": ["Pro Quality", "Smart Design", "Built To Last"],
+        "voiceover_script": (
+            f"Looking for something truly unstoppable? Meet the all-new {brand}! "
+            f"Designed for {hint_clean}, it brings together pro quality, smart design, and unmatched performance. "
+            f"Upgrade your everyday — grab your {brand} today!"
+        ),
+        "scene_prompts": [
+            (
+                f"Photorealistic TV commercial frame: A warm sunlit modern home lifestyle scene where a smiling person "
+                f"is happily holding and looking at the EXACT product from the reference image. Keep the product's branding, "
+                f"shape, and colors 100% identical. Shallow depth of field, cinematic warm commercial lighting, no text overlays."
+            ),
+            (
+                f"Photorealistic extreme macro TV commercial close-up showing the EXACT product from the reference image "
+                f"in active slow-motion use, highlighting its texture and real function. Dramatic studio rim light, rich contrast, no text."
+            ),
+            (
+                f"High-speed 3D CGI commercial explosion shot: dynamic glowing liquid splash, energy waves, or crisp particles "
+                f"swirling dramatically around the EXACT product from the reference image in rich studio lighting, no text."
+            ),
+            (
+                f"Clean hero TV commercial packshot: the EXACT product from the reference image standing boldly on a sleek "
+                f"warm tabletop with soft sunlight in the background, clear space at the top for headline text, ultra sharp 8k."
+            ),
         ],
     }
 
 
-def analyze_product_with_gemini(image_path: Path, user_hint: str) -> dict:
+def plan_commercial_with_gemini(image_path: Path, user_hint: str) -> dict:
     if not GEMINI_API_KEY:
-        return _fallback_ad_plan(image_path, user_hint)
+        return _fallback_commercial_plan(image_path, user_hint)
 
     client = genai.Client(api_key=GEMINI_API_KEY)
     img = Image.open(image_path).convert("RGB")
     img.thumbnail((800, 800), Image.Resampling.LANCZOS)
 
-    system_prompt = f"""
-You are an elite 3D CGI commercial director (like Apple, Nike, Dior, and Sony commercials).
-Analyze the EXACT product in the image and the user's brief: "{user_hint or 'Make a cinematic 3D CGI luxury ad showcasing its real functions so customers buy it'}".
+    prompt = f"""
+You are an award-winning TV Commercial Director (like viral Kellogg's / Apple / Nike 20-second ads).
+Look carefully at the exact product in the uploaded image and the user's note: "{user_hint or 'Make a high-converting 3D cinematic TV commercial in English'}".
 
-Write EVERYTHING in sleek, persuasive, high-converting commercial ENGLISH.
+Design a 4-scene commercial following this exact structure:
+- Scene 1 (Lifestyle Hook): Real people in a natural warm setting excitedly interacting with THIS EXACT product.
+- Scene 2 (Hero Action Macro): Close-up slow-motion shot demonstrating THIS EXACT product's main function in action.
+- Scene 3 (3D CGI Splash/Energy): Dramatic 3D CGI slow-motion splash/particles/dynamic elements swirling around THIS EXACT product.
+- Scene 4 (Final Packshot): Clean tabletop product packshot with space at top for bold headline text.
+
+Also provide:
+- 3 ultra-short punchy signpost callout labels (2 words max each, like "High Protein", "High Fibre", "No Maida" — tailored to THIS product's real benefits!).
+- A bold 2-line packshot headline (`headline_top` and `headline_bottom`, 2-3 words each).
+- An energetic, persuasive ENGLISH commercial voiceover script (35-45 words, ~15 seconds spoken).
 
 Return ONLY valid JSON:
 {{
-  "hero_brand": "1-2 word bold brand/product title",
-  "product_name": "2-4 word product name",
-  "tagline": "2-4 word punchy sales tagline",
-  "key_functions": [
-    {{"title": "2-3 WORD FUNCTION", "detail": "4-6 word buyer benefit"}},
-    {{"title": "2-3 WORD FUNCTION", "detail": "4-6 word buyer benefit"}},
-    {{"title": "2-3 WORD FUNCTION", "detail": "4-6 word buyer benefit"}}
-  ],
-  "voiceover_script": "30 to 38 words in crisp, confident luxury English (approx 12 seconds). Strong hook, real product benefits, urgent call-to-action.",
-  "cgi_prompts": [
-    "3D CGI commercial prompt 1: 360-degree 3D studio reveal of the exact product on a dark luxury pedestal, volumetric lighting, Octane render, sharp product fidelity, no text.",
-    "3D CGI commercial prompt 2: Dramatic 3D CGI action shot showing the exact product demonstrating its primary function in slow motion (e.g., water splash / glowing display / mist spray / precision motion), cinematic lighting, no text.",
-    "3D CGI commercial prompt 3: Macro 3D hero packshot of the exact product with gleaming studio reflections, smooth dolly zoom, luxury commercial finish, no text."
-  ],
-  "scenes": [
-    {{"scene_style": "3d_orbit_reveal", "feature_idx": 0}},
-    {{"scene_style": "function_showcase", "feature_idx": 0}},
-    {{"scene_style": "macro_3d_sweep", "feature_idx": 1}},
-    {{"scene_style": "function_showcase", "feature_idx": 2}},
-    {{"scene_style": "luxury_cta_finale", "feature_idx": 2}}
+  "brand_name": "Short product/brand name",
+  "headline_top": "2-3 WORD UPPERCASE LINE 1",
+  "headline_bottom": "2-3 WORD UPPERCASE LINE 2",
+  "signposts": ["Benefit 1", "Benefit 2", "Benefit 3"],
+  "voiceover_script": "Energetic 35-45 word English TV commercial voiceover script with hook, 3 benefits, and buy-now CTA.",
+  "scene_prompts": [
+    "Detailed prompt for Scene 1 keeping the exact reference product identical, no text overlays.",
+    "Detailed prompt for Scene 2 keeping the exact reference product identical, no text overlays.",
+    "Detailed prompt for Scene 3 keeping the exact reference product identical, no text overlays.",
+    "Detailed prompt for Scene 4 clean tabletop packshot keeping the exact reference product identical, space at top, no text overlays."
   ]
 }}
 """
     for model_name in ("gemini-2.5-flash", "gemini-3-flash-preview", "gemini-3.5-flash-lite"):
         try:
-            response = client.models.generate_content(
+            resp = client.models.generate_content(
                 model=model_name,
-                contents=[system_prompt, img],
+                contents=[prompt, img],
                 config=types.GenerateContentConfig(response_mime_type="application/json"),
             )
-            txt = (response.text or "").strip()
+            txt = (resp.text or "").strip()
             if txt.startswith("```"):
                 txt = txt.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
             data = json.loads(txt)
-            if "voiceover_script" in data and "cgi_prompts" in data:
+            if len(data.get("scene_prompts", [])) >= 4 and len(data.get("signposts", [])) >= 3:
                 return data
         except Exception as e:
-            print(f"Gemini failed on {model_name}: {repr(e)}", flush=True)
+            print(f"Planner failed on {model_name}: {repr(e)}", flush=True)
             continue
-    return _fallback_ad_plan(image_path, user_hint)
+
+    return _fallback_commercial_plan(image_path, user_hint)
 
 
 async def create_english_voiceover(text: str, out_mp3: Path, voice_accent: str):
@@ -214,257 +156,146 @@ async def create_english_voiceover(text: str, out_mp3: Path, voice_accent: str):
     }
     voice = voice_map.get(voice_accent, "en-US-AriaNeural")
     try:
-        communicate = edge_tts.Communicate(text=text, voice=voice, rate="+5%")
+        communicate = edge_tts.Communicate(text=text, voice=voice, rate="+7%")
         await communicate.save(str(out_mp3))
     except Exception as e:
-        print(f"Edge-TTS failed ({e}), using gTTS English fallback...", flush=True)
+        print(f"Edge-TTS failed ({e}), using gTTS fallback...", flush=True)
         gTTS(text=text, lang="en", tld="com").save(str(out_mp3))
 
 
-def _prep_studio_reference_png(clean_product: Image.Image, aspect_ratio: str) -> bytes:
-    """Places the isolated HD product onto a clean dark luxury studio canvas for Image-to-Video AI."""
-    W, H = (720, 1280) if aspect_ratio == "9:16" else (1280, 720)
-    canvas = Image.new("RGB", (W, H), (12, 16, 26))
-    prod = clean_product.copy()
-    prod.thumbnail((int(W * 0.62), int(H * 0.56)), Image.Resampling.LANCZOS)
-    px = (W - prod.width) // 2
-    py = (H - prod.height) // 2
-    canvas.paste(prod, (px, py), prod)
-    out = io.BytesIO()
-    canvas.save(out, format="PNG")
-    return out.getvalue()
-
-
-def _generate_fal_cgi_clips(
-    clean_product: Image.Image,
-    plan: dict,
-    aspect_ratio: str,
-    job_dir: Path,
-    job_id: str,
-) -> list[Path] | None:
-    """Calls Fal.ai Image-to-Video (Wan 2.2 / Kling) to generate TRUE 3D CGI cinematic clips."""
-    if not FAL_KEY:
-        return None
-
-    ref_png = _prep_studio_reference_png(clean_product, aspect_ratio)
-    data_uri = "data:image/png;base64," + base64.b64encode(ref_png).decode("utf-8")
-    headers = {"Authorization": f"Key {FAL_KEY}", "Content-Type": "application/json"}
-    prompts = plan.get("cgi_prompts", [])[:3]
-    clips = []
-
-    with httpx.Client(timeout=240.0) as client:
-        for idx, prompt in enumerate(prompts):
-            JOBS[job_id]["step"] = f"Generating TRUE 3D CGI Scene {idx + 1}/{len(prompts)} via AI Video..."
-            JOBS[job_id]["progress"] = 35 + idx * 18
+def generate_scene_keyframe(ref_image: Image.Image, prompt: str, aspect_ratio: str, out_png: Path) -> Path:
+    """
+    Places the EXACT uploaded product into a photorealistic commercial scene using:
+    1) Gemini Nano Banana (gemini-3.1-flash-image-preview / gemini-2.5-flash-image)
+    2) Fal.ai FLUX.1 Kontext [pro] (if FAL_KEY is set)
+    Falls back to cropped reference image if both are unavailable.
+    """
+    if GEMINI_API_KEY:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        for img_model in ("gemini-3.1-flash-image-preview", "gemini-2.5-flash-image"):
             try:
-                submit_res = client.post(
-                    f"https://queue.fal.run/{FAL_MODEL}",
-                    headers=headers,
-                    json={
-                        "image_url": data_uri,
-                        "prompt": prompt,
-                        "aspect_ratio": aspect_ratio,
-                    },
+                resp = client.models.generate_content(
+                    model=img_model,
+                    contents=[prompt, ref_image],
+                    config=types.GenerateContentConfig(
+                        response_modalities=["IMAGE"],
+                        image_config=types.ImageConfig(aspect_ratio=aspect_ratio),
+                    ),
                 )
-                submit_res.raise_for_status()
-                q = submit_res.json()
-                status_url = q["status_url"]
-                response_url = q["response_url"]
+                for cand in getattr(resp, "candidates", []) or []:
+                    for part in getattr(cand.content, "parts", []) or []:
+                        if getattr(part, "inline_data", None) and part.inline_data.data:
+                            gen = Image.open(io.BytesIO(part.inline_data.data)).convert("RGB")
+                            gen.save(out_png, format="PNG")
+                            return out_png
+            except Exception as e:
+                print(f"Gemini Image ({img_model}) failed: {repr(e)}", flush=True)
+                continue
 
+    if FAL_KEY:
+        try:
+            buf = io.BytesIO()
+            ref_image.save(buf, format="PNG")
+            data_uri = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
+            headers = {"Authorization": f"Key {FAL_KEY}", "Content-Type": "application/json"}
+            with httpx.Client(timeout=180.0) as hc:
+                sub = hc.post(
+                    "https://queue.fal.run/fal-ai/flux-pro/kontext",
+                    headers=headers,
+                    json={"prompt": prompt, "image_url": data_uri, "aspect_ratio": aspect_ratio},
+                )
+                sub.raise_for_status()
+                q = sub.json()
+                for _ in range(60):
+                    time.sleep(2)
+                    st = hc.get(q["status_url"], headers=headers).json()
+                    if st.get("status") == "COMPLETED":
+                        res = hc.get(q["response_url"], headers=headers).json()
+                        img_url = res["images"][0]["url"]
+                        out_png.write_bytes(hc.get(img_url).content)
+                        return out_png
+                    if st.get("status") in ("FAILED", "CANCELLED"):
+                        break
+        except Exception as e:
+            print(f"Fal Kontext failed: {repr(e)}", flush=True)
+
+    # Clean fallback resize of original product image
+    W, H = (720, 1280) if aspect_ratio == "9:16" else (1280, 720)
+    bg = Image.new("RGB", (W, H), (18, 22, 32))
+    prod = ref_image.copy()
+    prod.thumbnail((W, H), Image.Resampling.LANCZOS)
+    bg.paste(prod, ((W - prod.width) // 2, (H - prod.height) // 2))
+    bg.save(out_png, format="PNG")
+    return out_png
+
+
+def animate_keyframe_with_ai_video(keyframe_png: Path, motion_prompt: str, aspect_ratio: str, out_mp4: Path) -> bool:
+    """Animates a commercial keyframe into real moving video via Fal Wan 2.2 or Gemini Omni."""
+    if FAL_KEY:
+        try:
+            data_uri = "data:image/png;base64," + base64.b64encode(keyframe_png.read_bytes()).decode("utf-8")
+            headers = {"Authorization": f"Key {FAL_KEY}", "Content-Type": "application/json"}
+            with httpx.Client(timeout=240.0) as hc:
+                sub = hc.post(
+                    f"https://queue.fal.run/{FAL_VIDEO_MODEL}",
+                    headers=headers,
+                    json={"image_url": data_uri, "prompt": motion_prompt, "aspect_ratio": aspect_ratio},
+                )
+                sub.raise_for_status()
+                q = sub.json()
                 for _ in range(90):
                     time.sleep(3)
-                    st = client.get(status_url, headers=headers).json()
+                    st = hc.get(q["status_url"], headers=headers).json()
                     if st.get("status") == "COMPLETED":
+                        res = hc.get(q["response_url"], headers=headers).json()
+                        vurl = res.get("video", {}).get("url")
+                        if vurl:
+                            out_mp4.write_bytes(hc.get(vurl).content)
+                            return True
                         break
                     if st.get("status") in ("FAILED", "CANCELLED"):
-                        raise RuntimeError(f"Fal job failed: {st}")
-
-                res_data = client.get(response_url, headers=headers).json()
-                video_url = res_data.get("video", {}).get("url")
-                if not video_url:
-                    raise RuntimeError(f"Missing video URL in Fal response: {res_data}")
-
-                clip_path = job_dir / f"cgi_{idx}.mp4"
-                clip_path.write_bytes(client.get(video_url).content)
-                clips.append(clip_path)
-            except Exception as e:
-                print(f"Fal CGI generation failed on scene {idx}: {repr(e)}", flush=True)
-                return None
-    return clips if clips else None
-
-
-def _generate_gemini_omni_clip(
-    clean_product: Image.Image,
-    plan: dict,
-    aspect_ratio: str,
-    out_mp4: Path,
-) -> bool:
-    """Calls Google Gemini Omni 1.2 Flash (requires Paid Tier billing) for TRUE 3D CGI video."""
-    if not (USE_GEMINI_OMNI and GEMINI_API_KEY):
-        return False
-
-    try:
-        ref_png = _prep_studio_reference_png(clean_product, aspect_ratio)
-        img_b64 = base64.b64encode(ref_png).decode("utf-8")
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        full_prompt = " ".join(plan.get("cgi_prompts", []))[:800]
-        interaction = client.interactions.create(
-            model="gemini-omni-1.2-flash",
-            input=[
-                {"type": "image", "data": img_b64, "mime_type": "image/png"},
-                {"type": "text", "text": full_prompt},
-            ],
-            response_format={
-                "type": "video",
-                "aspect_ratio": aspect_ratio,
-                "resolution": "720p",
-                "duration": "12s",
-            },
-        )
-        video_bytes = None
-        if getattr(interaction, "output_video", None) and getattr(interaction.output_video, "data", None):
-            video_bytes = base64.b64decode(interaction.output_video.data)
-        elif getattr(interaction, "steps", None):
-            for step in interaction.steps:
-                for item in getattr(step, "content", []) or []:
-                    if getattr(item, "type", None) == "video" and getattr(item, "data", None):
-                        video_bytes = base64.b64decode(item.data)
                         break
-        if video_bytes:
-            out_mp4.write_bytes(video_bytes)
-            return True
-    except Exception as e:
-        print(f"Gemini Omni 1.2 Flash failed: {repr(e)}", flush=True)
+        except Exception as e:
+            print(f"Fal video failed: {repr(e)}", flush=True)
+
+    if USE_GEMINI_OMNI and GEMINI_API_KEY:
+        try:
+            client = genai.Client(api_key=GEMINI_API_KEY)
+            img_b64 = base64.b64encode(keyframe_png.read_bytes()).decode("utf-8")
+            interaction = client.interactions.create(
+                model="gemini-omni-1.2-flash",
+                input=[
+                    {"type": "image", "data": img_b64, "mime_type": "image/png"},
+                    {"type": "text", "text": motion_prompt},
+                ],
+                response_format={"type": "video", "aspect_ratio": aspect_ratio, "resolution": "720p", "duration": "5s"},
+            )
+            vbytes = None
+            if getattr(interaction, "output_video", None) and getattr(interaction.output_video, "data", None):
+                vbytes = base64.b64decode(interaction.output_video.data)
+            elif getattr(interaction, "steps", None):
+                for step in interaction.steps:
+                    for item in getattr(step, "content", []) or []:
+                        if getattr(item, "type", None) == "video" and getattr(item, "data", None):
+                            vbytes = base64.b64decode(item.data)
+                            break
+            if vbytes:
+                out_mp4.write_bytes(vbytes)
+                return True
+        except Exception as e:
+            print(f"Gemini Omni failed: {repr(e)}", flush=True)
+
     return False
 
 
-def _generate_modal_clip(clean_product: Image.Image, plan: dict, aspect_ratio: str, out_mp4: Path) -> bool:
-    if not MODAL_VIDEO_URL:
-        return False
-    try:
-        ref_png = _prep_studio_reference_png(clean_product, aspect_ratio)
-        img_b64 = base64.b64encode(ref_png).decode("utf-8")
-        payload = {
-            "image_base64": img_b64,
-            "prompt": " ".join(plan.get("cgi_prompts", []))[:800],
-            "aspect_ratio": aspect_ratio,
-            "duration": 10,
-        }
-        with httpx.Client(timeout=240.0) as client_http:
-            resp = client_http.post(MODAL_VIDEO_URL, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            if "video_base64" in data:
-                out_mp4.write_bytes(base64.b64decode(data["video_base64"]))
-                return True
-            if "video_url" in data:
-                out_mp4.write_bytes(client_http.get(data["video_url"]).content)
-                return True
-    except Exception as e:
-        print(f"MODAL_VIDEO_URL failed: {repr(e)}", flush=True)
-    return False
-
-
-def _find_perspective_coeffs(dst_pts, src_pts):
-    matrix = []
-    for (dx, dy), (sx, sy) in zip(dst_pts, src_pts):
-        matrix.append([dx, dy, 1, 0, 0, 0, -sx * dx, -sx * dy])
-        matrix.append([0, 0, 0, dx, dy, 1, -sy * dx, -sy * dy])
-    A = np.array(matrix, dtype=np.float64)
-    B = np.array([c for pt in src_pts for c in pt], dtype=np.float64)
-    return np.linalg.solve(A, B).tolist()
-
-
-def _render_3d_tilted_hd(product: Image.Image, tilt_deg: float, scale: float = 1.0) -> Image.Image:
-    pw, ph = product.size
-    sw, sh = max(40, int(pw * scale)), max(40, int(ph * scale))
-    img = product.resize((sw, sh), Image.Resampling.LANCZOS)
-    img = ImageOps.expand(img, border=6, fill=(0, 0, 0, 0))
-    iw, ih = img.size
-
-    rad = math.radians(max(-30.0, min(30.0, tilt_deg)))
-    pad_x = int(iw * 0.14)
-    pad_y = int(ih * 0.14)
-    cw, ch = iw + pad_x * 2, ih + pad_y * 2
-
-    inset_x = iw * (1.0 - math.cos(rad)) * 0.40
-    shift_y = ih * math.sin(rad) * 0.20
-
-    src_pts = [(0, 0), (iw, 0), (iw, ih), (0, ih)]
-    dst_pts = [
-        (pad_x + inset_x, pad_y - shift_y),
-        (pad_x + iw - inset_x, pad_y + shift_y),
-        (pad_x + iw - inset_x, pad_y + ih - shift_y),
-        (pad_x + inset_x, pad_y + ih + shift_y),
-    ]
-    coeffs = _find_perspective_coeffs(dst_pts, src_pts)
-    return img.transform((cw, ch), Image.Transform.PERSPECTIVE, coeffs, Image.Resampling.BICUBIC)
-
-
-def _add_studio_reflection(canvas: Image.Image, tilted_prod: Image.Image, x: int, y: int) -> None:
-    pw, ph = tilted_prod.size
-    shadow = Image.new("RGBA", (pw, 52), (0, 0, 0, 0))
-    ImageDraw.Draw(shadow).ellipse([int(pw * 0.14), 10, int(pw * 0.86), 42], fill=(0, 0, 0, 165))
-    shadow = shadow.filter(ImageFilter.GaussianBlur(14))
-    canvas.alpha_composite(shadow, (x, y + ph - int(ph * 0.15)))
-
-    refl_h = int(ph * 0.36)
-    refl = ImageOps.flip(tilted_prod).crop((0, 0, pw, refl_h))
-    _, _, _, a = refl.split()
-    a_np = np.array(a, dtype=np.float32)
-    grad = np.linspace(0.30, 0.0, refl_h)[:, None]
-    refl.putalpha(Image.fromarray(np.clip(a_np * grad, 0, 255).astype(np.uint8), "L"))
-    canvas.alpha_composite(refl.filter(ImageFilter.GaussianBlur(1.5)), (x, y + ph - int(ph * 0.13)))
-
-
-def _make_studio_bg(w: int, h: int, c_edge: tuple, c_center: tuple, floor_y: float = 0.73) -> Image.Image:
-    y, x = np.mgrid[0:h, 0:w]
-    dist = np.sqrt(((x - w * 0.5) / (w * 0.62)) ** 2 + ((y - h * 0.42) / (h * 0.50)) ** 2)
-    t = np.clip(1.0 - dist, 0.0, 1.0) ** 1.7
-    rgb = np.zeros((h, w, 3), dtype=np.uint8)
-    for ch in range(3):
-        rgb[:, :, ch] = np.clip(c_edge[ch] + t * (c_center[ch] - c_edge[ch]), 0, 255).astype(np.uint8)
-    img = Image.fromarray(rgb, "RGB").convert("RGBA")
-    fy = int(h * floor_y)
-    ImageDraw.Draw(img).line([(0, fy), (w, fy)], fill=(148, 163, 184, 55), width=2)
-    return img
-
-
-def generate_hd_studio_fallback_clip(
-    product: Image.Image,
-    scene: dict,
-    plan: dict,
-    aspect_ratio: str,
-    out_mp4: Path,
-):
-    """High-definition 720p Studio Preview fallback when no paid 3D Video API key is configured."""
+def animate_keyframe_cinematic_hd(keyframe_png: Path, mode: str, aspect_ratio: str, duration_sec: float, out_mp4: Path):
+    """Smooth HD 60fps-style Ken Burns camera motion on photorealistic AI-generated commercial frames."""
     W, H = (720, 1280) if aspect_ratio == "9:16" else (1280, 720)
     fps = 24
-    total_frames = 54
-
-    scene_style = scene.get("scene_style", "3d_orbit_reveal")
-    features = plan.get("key_functions", [{"title": "PRO QUALITY", "detail": "Crafted for performance"}])
-    feat = features[int(scene.get("feature_idx", 0)) % max(1, len(features))]
-
-    hero = product.copy()
-    hero.thumbnail((int(W * 0.62), int(H * 0.48)), Image.Resampling.LANCZOS)
-    rng = random.Random(hash(scene_style) & 0xFFFF)
-
-    font_title = _load_font(28)
-    font_sub = _load_font(20)
-    font_big = _load_font(56, serif=True)
-    font_cta = _load_font(30)
-
-    if scene_style == "macro_3d_sweep":
-        bg = _make_studio_bg(W, H, (12, 10, 22), (38, 28, 66), floor_y=0.78)
-        macro = product.copy()
-        macro.thumbnail((int(W * 1.10), int(H * 0.90)), Image.Resampling.LANCZOS)
-        mw, mh = macro.size
-    elif scene_style == "luxury_cta_finale":
-        bg = _make_studio_bg(W, H, (6, 9, 16), (26, 38, 62), floor_y=0.73)
-        sparks = [(rng.uniform(0, 2 * math.pi), rng.uniform(W * 0.22, W * 0.42), rng.randint(4, 9), rng.uniform(0.8, 1.8)) for _ in range(28)]
-    else:
-        bg = _make_studio_bg(W, H, (5, 8, 15), (22, 46, 82), floor_y=0.73)
+    total_frames = int(duration_sec * fps)
+    src = Image.open(keyframe_png).convert("RGB")
+    src = src.resize((int(W * 1.18), int(H * 1.18)), Image.Resampling.LANCZOS)
+    sw, sh = src.size
 
     cmd = [
         "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
@@ -476,134 +307,205 @@ def generate_hd_studio_fallback_clip(
 
     for f in range(total_frames):
         p = f / max(1, total_frames - 1)
-        ease = 1.0 - (1.0 - p) ** 3
-        frame = bg.copy()
+        if mode == "zoom_in":
+            scale = 1.0 + 0.14 * p
+            ox = int((sw - W / scale) * 0.5)
+            oy = int((sh - H / scale) * 0.5)
+        elif mode == "pan_right":
+            scale = 1.10
+            ox = int((sw - W / scale) * (0.2 + 0.6 * p))
+            oy = int((sh - H / scale) * 0.5)
+        elif mode == "dramatic_push":
+            scale = 1.02 + 0.16 * (p ** 0.8)
+            ox = int((sw - W / scale) * (0.5 + 0.06 * math.sin(p * math.pi * 2)))
+            oy = int((sh - H / scale) * 0.48)
+        else:  # gentle_settle
+            scale = 1.12 - 0.10 * p
+            ox = int((sw - W / scale) * 0.5)
+            oy = int((sh - H / scale) * 0.5)
 
-        sweep = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        sx = int(-W * 0.4 + p * W * 1.8)
-        ImageDraw.Draw(sweep).polygon(
-            [(sx, 0), (sx + 150, 0), (sx - H // 2 + 150, H), (sx - H // 2, H)],
-            fill=(186, 230, 253, 24),
-        )
-        frame = Image.alpha_composite(frame, sweep.filter(ImageFilter.GaussianBlur(22)))
-
-        if scene_style == "macro_3d_sweep":
-            ox = int((W - mw) * (0.15 + 0.7 * p))
-            oy = int((H - mh) * (0.25 + 0.35 * math.sin(p * math.pi)))
-            frame.alpha_composite(macro, (ox, oy))
-            d = ImageDraw.Draw(frame)
-            bx0, by0, bx1, by1 = int(W * 0.08), int(H * 0.78), int(W * 0.92), int(H * 0.90)
-            d.rounded_rectangle([bx0, by0, bx1, by1], radius=20, fill=(10, 15, 28, 210), outline=(56, 189, 248, 200), width=2)
-            d.text((bx0 + 28, by0 + 20), f"✦ {feat['title'].upper()}", font=font_title, fill=(56, 189, 248, 255))
-            d.text((bx0 + 28, by0 + 62), feat["detail"], font=font_sub, fill=(226, 232, 240, 240))
-
-        elif scene_style == "function_showcase":
-            tilt = math.sin(p * math.pi * 1.5 - 0.5) * 20.0
-            bob = int(math.sin(p * math.pi * 2) * 12)
-            tilted = _render_3d_tilted_hd(hero, tilt_deg=tilt, scale=0.95 + 0.05 * ease)
-            px = W // 2 - tilted.width // 2
-            py = int(H * 0.46 - tilted.height // 2) + bob
-            _add_studio_reflection(frame, tilted, px, py)
-            frame.alpha_composite(tilted, (px, py))
-
-            card_alpha = int(min(1.0, p / 0.25) * 225)
-            hud = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-            hd = ImageDraw.Draw(hud)
-            card_y = int(H * 0.11)
-            card_x0 = int(W * 0.08)
-            card_x1 = int(W * 0.92) if aspect_ratio == "9:16" else int(W * 0.50)
-            hd.rounded_rectangle(
-                [card_x0, card_y, card_x1, card_y + 116],
-                radius=20,
-                fill=(12, 19, 34, card_alpha),
-                outline=(56, 189, 248, card_alpha),
-                width=2,
-            )
-            hd.text((card_x0 + 26, card_y + 20), f"✦ {feat['title'].upper()}", font=font_title, fill=(56, 189, 248, 255))
-            hd.text((card_x0 + 26, card_y + 62), feat["detail"], font=font_sub, fill=(241, 245, 249, 240))
-            frame = Image.alpha_composite(frame, hud)
-
-        elif scene_style == "luxury_cta_finale":
-            tilt = (1.0 - ease) * -16.0
-            tilted = _render_3d_tilted_hd(hero, tilt_deg=tilt, scale=0.94 + 0.10 * ease)
-            px = W // 2 - tilted.width // 2
-            py = int(H * 0.44 - tilted.height // 2)
-            _add_studio_reflection(frame, tilted, px, py)
-            frame.alpha_composite(tilted, (px, py))
-
-            sd = ImageDraw.Draw(frame)
-            for ang, rad, sz, spd in sparks:
-                a = ang + p * spd * 3.0
-                sx_p = int(W // 2 + math.cos(a) * rad)
-                sy_p = int(H * 0.42 + math.sin(a) * rad * 0.6)
-                sd.polygon([(sx_p, sy_p - sz), (sx_p + sz, sy_p), (sx_p, sy_p + sz), (sx_p - sz, sy_p)], fill=(226, 232, 240, 210))
-
-            btn_w, btn_h = int(W * 0.58), 72
-            bx0, by0 = W // 2 - btn_w // 2, int(H * 0.80)
-            sd.rounded_rectangle([bx0, by0, bx0 + btn_w, by0 + btn_h], radius=36, fill=(14, 165, 233, 245), outline=(255, 255, 255, 210), width=2)
-            cta_txt = "ORDER NOW →"
-            tw = sd.textlength(cta_txt, font=font_cta)
-            sd.text((W // 2 - tw // 2, by0 + 18), cta_txt, font=font_cta, fill=(255, 255, 255, 255))
-
-        else:
-            tilt = -24.0 + 36.0 * ease
-            scale = 0.84 + 0.20 * ease
-            tilted = _render_3d_tilted_hd(hero, tilt_deg=tilt, scale=scale)
-            px = W // 2 - tilted.width // 2
-            py = int(H * 0.47 - tilted.height // 2)
-            _add_studio_reflection(frame, tilted, px, py)
-            frame.alpha_composite(tilted, (px, py))
-
-            d = ImageDraw.Draw(frame)
-            brand = plan.get("hero_brand", "LUXURY").upper()[:18]
-            bw = d.textlength(brand, font=font_big)
-            d.text((W // 2 - bw // 2, int(H * 0.11)), brand, font=font_big, fill=(255, 255, 255, int(235 * ease)))
-
-        proc.stdin.write(frame.convert("RGB").tobytes())
+        cw, ch = int(W / scale), int(H / scale)
+        ox = max(0, min(sw - cw, ox))
+        oy = max(0, min(sh - ch, oy))
+        frame = src.crop((ox, oy, ox + cw, oy + ch)).resize((W, H), Image.Resampling.LANCZOS)
+        proc.stdin.write(frame.tobytes())
 
     proc.stdin.close()
     err = proc.stderr.read().decode(errors="ignore")
     if proc.wait() != 0:
-        raise RuntimeError("FFmpeg clip render failed: " + err[-250:])
-    del bg
-    gc.collect()
+        raise RuntimeError("FFmpeg render failed: " + err[-250:])
 
 
-def finalize_audio_video(job_dir: Path, raw_clips: list[Path], voice_mp3: Path, aspect_ratio: str) -> Path:
-    w, h = (720, 1280) if aspect_ratio == "9:16" else (1280, 720)
-    styled_clips = []
+def _create_signpost_overlay(W: int, H: int, labels: list[str], out_mov: Path, duration_sec: float):
+    """Creates transparent animated Kellogg's-style stick signpost popups (Benefit 1, 2, 3)."""
+    fps = 24
+    total_frames = int(duration_sec * fps)
+    font = _load_font(34 if W < H else 38)
 
-    for idx, clip in enumerate(raw_clips):
-        styled = job_dir / f"styled_{idx}.mp4"
-        dur = get_duration(clip)
-        out_st = max(0.5, dur - 0.25)
+    # Pre-render the 3 tilted signpost boards
+    boards = []
+    positions = [
+        (int(W * 0.24), int(H * 0.52), -6),
+        (int(W * 0.72), int(H * 0.38), 5),
+        (int(W * 0.48), int(H * 0.45), -4),
+    ]
+    for label in labels[:3]:
+        words = label.strip().split()
+        line1 = words[0] if words else "PRO"
+        line2 = " ".join(words[1:]) if len(words) > 1 else ""
+        bw, bh = 240, 145 if line2 else 95
+        card = Image.new("RGBA", (bw, bh + 180), (0, 0, 0, 0))
+        d = ImageDraw.Draw(card)
+        # Wooden stick
+        d.rectangle([bw // 2 - 7, bh - 4, bw // 2 + 7, bh + 175], fill=(203, 166, 134, 255), outline=(92, 61, 46, 255), width=2)
+        # Cream signpost board
+        d.rounded_rectangle([4, 4, bw - 4, bh - 4], radius=16, fill=(255, 251, 240, 255), outline=(74, 44, 28, 255), width=5)
+        if line2:
+            w1 = d.textlength(line1, font=font)
+            w2 = d.textlength(line2, font=font)
+            d.text((bw // 2 - w1 // 2, 18), line1, font=font, fill=(60, 32, 18, 255))
+            d.text((bw // 2 - w2 // 2, 64), line2, font=font, fill=(60, 32, 18, 255))
+        else:
+            w1 = d.textlength(line1, font=font)
+            d.text((bw // 2 - w1 // 2, 26), line1, font=font, fill=(60, 32, 18, 255))
+        boards.append(card)
+
+    cmd = [
+        "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
+        "-pix_fmt", "rgba", "-s", f"{W}x{H}", "-r", str(fps), "-i", "-",
+        "-c:v", "png", "-pix_fmt", "rgba", str(out_mov),
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    seg = total_frames / 3.0
+
+    for f in range(total_frames):
+        frame = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        idx = min(2, int(f / seg))
+        local_p = (f - idx * seg) / max(1.0, seg)
+        # Spring pop-up from below
+        pop = min(1.0, local_p / 0.22)
+        ease = 1.0 - (1.0 - pop) ** 3
+        fade = 1.0 if local_p < 0.85 else max(0.0, (1.0 - local_p) / 0.15)
+
+        bx, by, angle = positions[idx]
+        rot = boards[idx].rotate(angle, expand=True, resample=Image.Resampling.BICUBIC)
+        if fade < 1.0:
+            r, g, b, a = rot.split()
+            a = a.point(lambda v: int(v * fade))
+            rot.putalpha(a)
+
+        y_off = int((1.0 - ease) * 90)
+        frame.alpha_composite(rot, (max(0, min(W - rot.width, bx - rot.width // 2)), max(0, min(H - rot.height, by - rot.height // 2 + y_off))))
+        proc.stdin.write(frame.tobytes())
+
+    proc.stdin.close()
+    proc.wait()
+
+
+def _create_packshot_headline_png(W: int, H: int, top_line: str, bottom_line: str, out_png: Path):
+    """Creates slanted bold Yellow + White TV-commercial packshot headline."""
+    banner = Image.new("RGBA", (W, int(H * 0.34)), (0, 0, 0, 0))
+    f_top = _load_font(54 if W < H else 62)
+    f_bot = _load_font(52 if W < H else 60)
+
+    txt_layer = Image.new("RGBA", (W, int(H * 0.32)), (0, 0, 0, 0))
+    d = ImageDraw.Draw(txt_layer)
+    t1 = top_line.upper()[:24]
+    t2 = bottom_line.upper()[:24]
+
+    w1 = d.textlength(t1, font=f_top)
+    w2 = d.textlength(t2, font=f_bot)
+    y1, y2 = 46, 118
+
+    # Drop shadow + Yellow line 1
+    d.text((W // 2 - w1 // 2 + 4, y1 + 5), t1, font=f_top, fill=(0, 0, 0, 170))
+    d.text((W // 2 - w1 // 2, y1), t1, font=f_top, fill=(250, 204, 21, 255))
+
+    # Drop shadow + White line 2
+    d.text((W // 2 - w2 // 2 + 4, y2 + 5), t2, font=f_bot, fill=(0, 0, 0, 170))
+    d.text((W // 2 - w2 // 2, y2), t2, font=f_bot, fill=(255, 255, 255, 255))
+
+    tilted = txt_layer.rotate(5, expand=False, resample=Image.Resampling.BICUBIC)
+    banner.alpha_composite(tilted, (0, 10))
+    banner.save(out_png, format="PNG")
+
+
+def assemble_commercial(
+    job_dir: Path,
+    scene_videos: list[Path],
+    voice_mp3: Path,
+    plan: dict,
+    aspect_ratio: str,
+) -> Path:
+    W, H = (720, 1280) if aspect_ratio == "9:16" else (1280, 720)
+
+    # 1) Create Signpost Pop-up overlay on Scene 3 (index 2)
+    s3_dur = get_duration(scene_videos[2])
+    signpost_mov = job_dir / "signposts.mov"
+    _create_signpost_overlay(W, H, plan.get("signposts", ["Pro Quality", "Smart Design", "Built Strong"]), signpost_mov, s3_dur)
+
+    s3_with_signs = job_dir / "scene3_signed.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", str(scene_videos[2]), "-i", str(signpost_mov),
+            "-filter_complex", "[0:v][1:v]overlay=0:0:shortest=1[v]",
+            "-map", "[v]", "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+            "-pix_fmt", "yuv420p", str(s3_with_signs),
+        ],
+        check=True,
+    )
+    scene_videos[2].unlink(missing_ok=True)
+    signpost_mov.unlink(missing_ok=True)
+    scene_videos[2] = s3_with_signs
+
+    # 2) Create Slanted Packshot Headline overlay on Scene 4 (index 3)
+    headline_png = job_dir / "headline.png"
+    _create_packshot_headline_png(W, H, plan.get("headline_top", "PURE ENERGY"), plan.get("headline_bottom", "BUILT TO LAST"), headline_png)
+    s4_with_head = job_dir / "scene4_headline.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", str(scene_videos[3]), "-i", str(headline_png),
+            "-filter_complex", "[0:v][1:v]overlay=0:25[v]",
+            "-map", "[v]", "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+            "-pix_fmt", "yuv420p", str(s4_with_head),
+        ],
+        check=True,
+    )
+    scene_videos[3].unlink(missing_ok=True)
+    headline_png.unlink(missing_ok=True)
+    scene_videos[3] = s4_with_head
+
+    # 3) Normalize & concat all 4 scenes cleanly
+    norm_clips = []
+    for i, sc in enumerate(scene_videos):
+        norm = job_dir / f"norm_{i}.mp4"
+        dur = get_duration(sc)
+        out_st = max(0.4, dur - 0.16)
         vf = (
-            f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps=24,"
-            f"eq=contrast=1.06:saturation=1.10,"
-            f"fade=t=in:st=0:d=0.18,fade=t=out:st={out_st:.2f}:d=0.20"
+            f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps=24,"
+            f"eq=contrast=1.05:saturation=1.08,fade=t=in:st=0:d=0.14,fade=t=out:st={out_st:.2f}:d=0.14"
         )
         subprocess.run(
             [
-                "ffmpeg", "-y", "-i", str(clip),
-                "-vf", vf, "-an",
-                "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-                "-pix_fmt", "yuv420p", "-threads", "2", str(styled),
+                "ffmpeg", "-y", "-i", str(sc), "-vf", vf, "-an",
+                "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p", str(norm),
             ],
             check=True,
         )
-        clip.unlink(missing_ok=True)
-        styled_clips.append(styled)
+        sc.unlink(missing_ok=True)
+        norm_clips.append(norm)
 
-    merged_video = job_dir / "merged_video.mp4"
-    concat_file = job_dir / "concat.txt"
-    concat_file.write_text("\n".join(f"file '{c.resolve()}'" for c in styled_clips), encoding="utf-8")
+    merged_video = job_dir / "merged.mp4"
+    concat_txt = job_dir / "concat.txt"
+    concat_txt.write_text("\n".join(f"file '{c.resolve()}'" for c in norm_clips), encoding="utf-8")
     subprocess.run(
-        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", str(merged_video)],
+        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_txt), "-c", "copy", str(merged_video)],
         check=True,
     )
-    for c in styled_clips:
+    for c in norm_clips:
         c.unlink(missing_ok=True)
 
+    # 4) Mix crisp English Voiceover + Energetic Commercial Pulse Beat
     vid_dur = get_duration(merged_video)
     aud_dur = get_duration(voice_mp3)
     target_dur = max(vid_dur, aud_dur + 0.6)
@@ -611,8 +513,8 @@ def finalize_audio_video(job_dir: Path, raw_clips: list[Path], voice_mp3: Path, 
 
     final_mp4 = job_dir / "final_ad.mp4"
     audio_filter = (
-        f"aevalsrc='0.06*sin(2*PI*55*t)*exp(-4*mod(t,0.5))+0.02*sin(2*PI*165*t)*exp(-8*mod(t,0.25))':s=44100:d={target_dur:.2f}[bg];"
-        f"[1:a]aresample=44100,volume=1.50[vo];"
+        f"aevalsrc='0.05*sin(2*PI*65*t)*exp(-5*mod(t,0.45))+0.025*sin(2*PI*195*t)*exp(-9*mod(t,0.225))':s=44100:d={target_dur:.2f}[bg];"
+        f"[1:a]aresample=44100,volume=1.55[vo];"
         f"[vo][bg]amix=inputs=2:duration=longest:dropout_transition=2[aout]"
     )
     video_filter = f"[0:v]tpad=stop_mode=clone:stop_duration={pad_sec:.2f}[vfinal]"
@@ -636,65 +538,49 @@ def finalize_audio_video(job_dir: Path, raw_clips: list[Path], voice_mp3: Path, 
 def run_pipeline(job_id: str, image_path: Path, hint: str, voice_accent: str, aspect_ratio: str):
     job_dir = image_path.parent
     try:
-        JOBS[job_id]["step"] = "Analyzing product & writing 3D CGI commercial script..."
+        JOBS[job_id]["step"] = "Planning 4-scene TV commercial & English script..."
         JOBS[job_id]["progress"] = 10
-        plan = analyze_product_with_gemini(image_path, hint)
+        plan = plan_commercial_with_gemini(image_path, hint)
         JOBS[job_id]["script"] = plan["voiceover_script"]
 
-        JOBS[job_id]["step"] = "Isolating product at HD resolution..."
+        JOBS[job_id]["step"] = "Recording energetic English commercial voiceover..."
         JOBS[job_id]["progress"] = 20
-        product_img = extract_product_hd(image_path.read_bytes())
-
-        JOBS[job_id]["step"] = "Recording English commercial voiceover..."
-        JOBS[job_id]["progress"] = 28
         voice_mp3 = job_dir / "voice.mp3"
         asyncio.run(create_english_voiceover(plan["voiceover_script"], voice_mp3, voice_accent))
 
-        raw_clips = None
-        mode_used = "True 3D CGI AI Video"
+        ref_img = Image.open(image_path).convert("RGB")
+        ref_img.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
 
-        # 1) Try Fal.ai Image-to-Video (Wan 2.2 / Kling)
-        if FAL_KEY:
-            raw_clips = _generate_fal_cgi_clips(product_img, plan, aspect_ratio, job_dir, job_id)
+        scene_prompts = plan["scene_prompts"][:4]
+        motion_modes = [("zoom_in", 4.5), ("pan_right", 3.8), ("dramatic_push", 5.2), ("gentle_settle", 3.5)]
+        scene_videos = []
 
-        # 2) Try Google Gemini Omni 1.2 Flash (Paid Tier)
-        if not raw_clips and USE_GEMINI_OMNI:
-            JOBS[job_id]["step"] = "Generating 3D CGI commercial via Gemini Omni..."
-            JOBS[job_id]["progress"] = 50
-            omni_mp4 = job_dir / "omni.mp4"
-            if _generate_gemini_omni_clip(product_img, plan, aspect_ratio, omni_mp4):
-                raw_clips = [omni_mp4]
+        for idx, sc_prompt in enumerate(scene_prompts):
+            JOBS[job_id]["step"] = f"Generating AI Commercial Scene {idx + 1}/4..."
+            JOBS[job_id]["progress"] = 28 + idx * 14
+            kf_png = job_dir / f"keyframe_{idx}.png"
+            generate_scene_keyframe(ref_img, sc_prompt, aspect_ratio, kf_png)
 
-        # 3) Try Modal GPU Backend
-        if not raw_clips and MODAL_VIDEO_URL:
-            JOBS[job_id]["step"] = "Generating 3D CGI commercial via Modal GPU..."
-            JOBS[job_id]["progress"] = 50
-            modal_mp4 = job_dir / "modal.mp4"
-            if _generate_modal_clip(product_img, plan, aspect_ratio, modal_mp4):
-                raw_clips = [modal_mp4]
+            sc_mp4 = job_dir / f"scene_{idx}.mp4"
+            JOBS[job_id]["step"] = f"Animating Scene {idx + 1}/4 into cinematic motion..."
+            mode, dur = motion_modes[idx]
+            if not animate_keyframe_with_ai_video(kf_png, sc_prompt, aspect_ratio, sc_mp4):
+                animate_keyframe_cinematic_hd(kf_png, mode, aspect_ratio, dur, sc_mp4)
 
-        # 4) Fallback: High-Definition 720p Studio Preview
-        if not raw_clips:
-            mode_used = "HD Studio Preview (Set FAL_KEY or USE_GEMINI_OMNI=true for true 3D CGI AI motion)"
-            raw_clips = []
-            for idx, scene in enumerate(plan["scenes"]):
-                JOBS[job_id]["step"] = f"Rendering HD Studio Scene {idx + 1}/5..."
-                JOBS[job_id]["progress"] = 35 + (idx * 10)
-                clip_path = job_dir / f"raw_{idx}.mp4"
-                generate_hd_studio_fallback_clip(product_img, scene, plan, aspect_ratio, clip_path)
-                raw_clips.append(clip_path)
+            kf_png.unlink(missing_ok=True)
+            scene_videos.append(sc_mp4)
 
-        del product_img
+        del ref_img
         gc.collect()
 
-        JOBS[job_id]["step"] = "Mixing English voiceover & exporting HD MP4..."
+        JOBS[job_id]["step"] = "Adding Signpost Callouts, Packshot Headline & English Voiceover..."
         JOBS[job_id]["progress"] = 90
-        finalize_audio_video(job_dir, raw_clips, voice_mp3, aspect_ratio)
+        assemble_commercial(job_dir, scene_videos, voice_mp3, plan, aspect_ratio)
 
         JOBS[job_id].update({
             "status": "done",
             "progress": 100,
-            "step": f"Done! ({mode_used})",
+            "step": "Your TV-style 3D Commercial Ad is ready!",
             "video_url": f"/download/{job_id}",
         })
     except Exception as exc:
@@ -705,11 +591,9 @@ def run_pipeline(job_id: str, image_path: Path, hint: str, voice_accent: str, as
 def healthz():
     return {
         "ok": True,
-        "rembg": HAS_REMBG,
-        "rembg_model": REMBG_MODEL,
+        "gemini_configured": bool(GEMINI_API_KEY),
         "fal_configured": bool(FAL_KEY),
         "gemini_omni": USE_GEMINI_OMNI,
-        "modal_configured": bool(MODAL_VIDEO_URL),
     }
 
 
@@ -754,16 +638,16 @@ def download_video(job_id: str):
     video_path = WORK_DIR / job_id / "final_ad.mp4"
     if not video_path.exists():
         return JSONResponse({"error": "Video not ready"}, status_code=404)
-    return FileResponse(video_path, media_type="video/mp4", filename=f"3d_cgi_ad_{job_id}.mp4")
+    return FileResponse(video_path, media_type="video/mp4", filename=f"tv_commercial_{job_id}.mp4")
 
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    cgi_ready = bool(FAL_KEY or USE_GEMINI_OMNI or MODAL_VIDEO_URL)
+    video_ai = bool(FAL_KEY or USE_GEMINI_OMNI)
     badge = (
-        '<span style="color:#10b981;font-weight:700;">● True 3D CGI AI Engine Active</span>'
-        if cgi_ready
-        else '<span style="color:#f59e0b;font-weight:700;">● HD Studio Preview Mode (Add FAL_KEY or USE_GEMINI_OMNI=true for True 3D CGI AI Motion)</span>'
+        '<span style="color:#10b981;font-weight:700;">● Full AI Video Motion + Scene Generation Active</span>'
+        if video_ai
+        else '<span style="color:#38bdf8;font-weight:700;">● Gemini AI Scene Staging + Cinematic Motion Active (Add FAL_KEY for full AI video motion)</span>'
     )
     return f"""
 <!DOCTYPE html>
@@ -771,49 +655,49 @@ def home():
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>AI 3D CGI Product Ad Studio</title>
+  <title>AI TV Commercial Ad Studio</title>
   <style>
     body {{ font-family: system-ui, sans-serif; background: #070b14; color: #f8fafc; margin: 0; padding: 24px; }}
     .card {{ max-width: 620px; margin: 0 auto; background: #111827; padding: 28px; border-radius: 16px; border: 1px solid #1f2937; }}
-    h1 {{ margin-top: 0; font-size: 1.55rem; color: #38bdf8; }}
+    h1 {{ margin-top: 0; font-size: 1.55rem; color: #facc15; }}
     label {{ display: block; margin-top: 16px; font-weight: 600; font-size: 0.92rem; color: #cbd5e1; }}
     input, textarea, select {{ width: 100%; margin-top: 6px; padding: 10px 12px; border-radius: 10px; border: 1px solid #334155; background: #0b1120; color: #fff; box-sizing: border-box; }}
-    button {{ width: 100%; margin-top: 22px; padding: 14px; border: none; border-radius: 10px; background: linear-gradient(90deg, #0ea5e9, #6366f1); color: #fff; font-weight: 700; font-size: 1rem; cursor: pointer; }}
+    button {{ width: 100%; margin-top: 22px; padding: 14px; border: none; border-radius: 10px; background: linear-gradient(90deg, #f59e0b, #ef4444); color: #fff; font-weight: 700; font-size: 1rem; cursor: pointer; }}
     button:disabled {{ opacity: 0.5; cursor: not-allowed; }}
     .progress-box {{ display: none; margin-top: 20px; background: #0b1120; padding: 14px; border-radius: 10px; }}
     .bar-bg {{ width: 100%; height: 10px; background: #1e293b; border-radius: 99px; overflow: hidden; margin-top: 8px; }}
-    .bar-fill {{ height: 100%; width: 0%; background: #38bdf8; transition: width 0.4s; }}
+    .bar-fill {{ height: 100%; width: 0%; background: #facc15; transition: width 0.4s; }}
     video {{ width: 100%; max-height: 540px; border-radius: 12px; margin-top: 16px; background: #000; }}
     .dl-btn {{ display: inline-block; margin-top: 12px; padding: 10px 18px; background: #10b981; color: #fff; text-decoration: none; border-radius: 8px; font-weight: 600; }}
   </style>
 </head>
 <body>
   <div class="card">
-    <h1>✨ AI 3D CGI Product Ad Studio</h1>
+    <h1>🎬 AI TV-Style Product Commercial Studio</h1>
     <p style="font-size:0.85rem;margin-top:-6px;">{badge}</p>
-    <p style="color:#94a3b8;font-size:0.9rem;">Upload any product photo. AI extracts only the product in HD, turns it into a cinematic 3D CGI commercial, and adds a sleek English voiceover.</p>
+    <p style="color:#94a3b8;font-size:0.9rem;">Upload your product photo. AI generates a 4-scene lifestyle + 3D CGI splash commercial with pop-up benefit signposts, slanted packshot headline & English voiceover.</p>
     <form id="adForm">
       <label>1. Upload Product Photo</label>
       <input type="file" name="image" accept="image/*" required />
 
-      <label>2. Product Features / CGI Direction (Optional)</label>
-      <textarea name="hint" rows="2" placeholder="e.g. Waterproof smartwatch, show water splashes and glowing AMOLED screen"></textarea>
+      <label>2. Product Benefits / Ad Concept (Optional)</label>
+      <textarea name="hint" rows="2" placeholder="e.g. Chocolate multigrain snack, high protein, no maida, mom & kid breakfast vibe"></textarea>
 
-      <label>3. English Voiceover Style</label>
+      <label>3. English Voiceover</label>
       <select name="voice_accent">
-        <option value="us_female" selected>US Luxury Female (Aria)</option>
-        <option value="uk_female">British Luxury Female (Sonia)</option>
+        <option value="us_female" selected>US Commercial Female (Aria)</option>
+        <option value="uk_female">British Commercial Female (Sonia)</option>
         <option value="in_female">Indian English Female (Neerja)</option>
-        <option value="us_male">US Deep Commercial Male (Guy)</option>
+        <option value="us_male">US Energetic Male (Guy)</option>
       </select>
 
-      <label>4. Aspect Ratio</label>
+      <label>4. Format</label>
       <select name="aspect_ratio">
-        <option value="9:16" selected>Instagram Reels / Shorts (9:16)</option>
-        <option value="16:9">YouTube / Amazon / Landscape (16:9)</option>
+        <option value="9:16" selected>Reels / Shorts (9:16)</option>
+        <option value="16:9">YouTube / TV (16:9)</option>
       </select>
 
-      <button type="submit" id="submitBtn">🎬 Generate 3D CGI Ad</button>
+      <button type="submit" id="submitBtn">🚀 Generate Commercial Ad</button>
     </form>
 
     <div class="progress-box" id="progressBox">
@@ -824,7 +708,7 @@ def home():
 
     <div id="resultBox" style="display:none;">
       <video id="adVideo" controls></video>
-      <a id="dlLink" class="dl-btn" download>⬇️ Download HD MP4 Ad</a>
+      <a id="dlLink" class="dl-btn" download>⬇️ Download Commercial MP4</a>
     </div>
   </div>
 
@@ -844,7 +728,7 @@ def home():
       btn.disabled = true;
       resultBox.style.display = "none";
       progressBox.style.display = "block";
-      statusText.innerText = "Uploading product image...";
+      statusText.innerText = "Uploading product photo...";
       barFill.style.width = "5%";
 
       const fd = new FormData(form);
