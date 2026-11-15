@@ -5,5 +5,3 @@ edge-tts
 httpx
 pillow
 gTTS
-rembg
-onnxruntime
