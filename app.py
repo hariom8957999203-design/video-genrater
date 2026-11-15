@@ -20,7 +20,13 @@ from google import genai
 from google.genai import types
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
-from rembg import remove
+def isolate_product(image_path: Path, output_png: Path) -> Path:
+    """ओरिजिनल इमेज से background हटाकर transparent product PNG बनाता है (Lazy Import)"""
+    from rembg import remove  # <--- यहाँ इम्पोर्ट करें ताकि स्टार्टअप पर हैंग न हो
+    img = Image.open(image_path).convert("RGB")
+    res = remove(img)
+    res.save(output_png, format="PNG")
+    return output_png
 
 app = FastAPI(title="AI Cinematic Product Commercial Studio")
 
