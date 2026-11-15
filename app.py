@@ -3,9 +3,7 @@ import base64
 import gc
 import io
 import json
-import math
 import os
-import random
 import shutil
 import subprocess
 import threading
@@ -22,7 +20,7 @@ from google.genai import types
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
-app = FastAPI(title="AI Cinematic 3D Product Commercial Studio")
+app = FastAPI(title="AI Cinematic 3D CGI Commercial Studio")
 
 WORK_DIR = Path("/tmp/ad_jobs")
 WORK_DIR.mkdir(parents=True, exist_ok=True)
@@ -30,6 +28,7 @@ JOBS = {}
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip().strip('"').strip("'")
 FAL_KEY = os.environ.get("FAL_KEY", "").strip().strip('"').strip("'")
+FAL_VIDEO_MODEL = os.environ.get("FAL_VIDEO_MODEL", "fal-ai/wan/v2.2-a14b/image-to-video").strip()
 
 
 def save_job(job_id: str, **updates):
@@ -57,7 +56,7 @@ def load_job(job_id: str) -> dict | None:
             pass
     final_mp4 = WORK_DIR / job_id / "final_ad.mp4"
     if final_mp4.exists():
-        return {"status": "done", "progress": 100, "step": "Your Commercial Ad is ready!", "video_url": f"/download/{job_id}"}
+        return {"status": "done", "progress": 100, "step": "Your CGI Commercial is ready!", "video_url": f"/download/{job_id}"}
     return None
 
 
@@ -79,71 +78,10 @@ def _load_font(size: int) -> ImageFont.FreeTypeFont:
     return ImageFont.load_default()
 
 
-def prepare_product_frame(image_path: Path, output_png: Path, scene_idx: int) -> Path:
-    """प्रोडक्ट को सिनेमैटिक 3D स्टूडियो लाइटिंग और पार्टिकल इफेक्ट्स के साथ तैयार करता है"""
-    img = Image.open(image_path).convert("RGBA")
-    W, H = 540, 960
-
-    # सीन के हिसाब से अलग-अलग ज़ूम और कंपोजीशन ताकि 3D कमर्शियल जैसा लगे
-    if scene_idx == 0:
-        img.thumbnail((int(W * 0.65), int(H * 0.65)), Image.Resampling.LANCZOS)
-    elif scene_idx == 1:
-        img.thumbnail((int(W * 0.85), int(H * 0.85)), Image.Resampling.LANCZOS) # Macro close-up feel
-    elif scene_idx == 2:
-        img.thumbnail((int(W * 0.70), int(H * 0.70)), Image.Resampling.LANCZOS)
-    else:
-        img.thumbnail((int(W * 0.75), int(H * 0.75)), Image.Resampling.LANCZOS)
-
-    # सिनेमैटिक डार्क लग्जरी स्टूडियो बैकग्राउंड (वियो और सोरा जैसे विज्ञापनों जैसा)
-    bg = Image.new("RGBA", (W, H), (10, 14, 24, 255))
-    draw = ImageDraw.Draw(bg)
-    
-    # रेडियल ग्लो / स्पॉटलाइट इफेक्ट
-    for y in range(H):
-        factor = 1.0 - abs(y - H // 2) / (H // 2) * 0.3
-        r = int(15 * factor)
-        g = int(22 * factor)
-        b = int(40 * factor)
-        draw.line([(0, y), (W, y)], fill=(r, g, b, 255))
-
-    # हवा में उड़ते हुए 3D पार्टिकल्स / स्पार्क्स (CGI Simulation)
-    for _ in range(35):
-        px = random.randint(10, W - 10)
-        py = random.randint(10, H - 10)
-        p_size = random.randint(2, 5)
-        alpha = random.randint(60, 180)
-        draw.ellipse([px, py, px + p_size, py + p_size], fill=(200, 220, 255, alpha))
-
-    px = (W - img.width) // 2
-    py = (H - img.height) // 2 + (20 if scene_idx == 1 else 0)
-
-    # रियलिस्टिक ड्रॉप शैडो और फ्लोर रिफ्लेक्शन
-    shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    sh_layer = Image.new("RGBA", img.size, (0, 0, 0, 180))
-    shadow.paste(sh_layer, (px, py + 30), img)
-    shadow = shadow.filter(ImageFilter.GaussianBlur(18))
-
-    bg.alpha_composite(shadow)
-    bg.alpha_composite(img, (px, py))
-
-    # सीन 1 पर स्टाइलिश टेक्स्ट ओवरले ("DAY 08 - MAKING PRODUCT ADS")
-    if scene_idx == 0:
-        f_sub = _load_font(20)
-        draw_txt = ImageDraw.Draw(bg)
-        draw_txt.text((35, 120), "MAKING PRODUCT ADS", font=f_sub, fill=(180, 200, 230, 220))
-        f_big = _load_font(36)
-        draw_txt.text((35, 150), "UNTIL BRAND NOTICES", font=f_big, fill=(255, 255, 255, 255))
-        draw_txt.text((35, 195), "DAY 08 🎬", font=f_big, fill=(250, 204, 21, 255))
-
-    final_img = bg.convert("RGB")
-    final_img.save(output_png, format="PNG")
-    return output_png
-
-
 def plan_commercial(image_path: Path, user_hint: str) -> dict:
     raw = image_path.stem.replace("_", " ").replace("-", " ").strip()
     brand = "".join(c for c in (raw.split()[0] if raw else "LUXE") if c.isalnum()).upper() or "LUXE"
-    hint_clean = (user_hint or "unmatched cinematic quality and premium daily lifestyle").strip()
+    hint_clean = (user_hint or "breathtaking 3D CGI design, cinematic lighting and ultimate premium quality").strip()
 
     if GEMINI_API_KEY:
         try:
@@ -151,15 +89,15 @@ def plan_commercial(image_path: Path, user_hint: str) -> dict:
             img = Image.open(image_path).convert("RGB")
             img.thumbnail((800, 800), Image.Resampling.LANCZOS)
             prompt = f"""
-You are an elite CGI Commercial Director (like Dior Sauvage or Apple 3D ads).
+You are an elite Hollywood CGI & Sora-style Commercial Director.
 Product image provided. User description: "{hint_clean}".
-Create a 4-scene high-converting commercial plan in JSON format:
+Create a 4-scene ultra-realistic cinematic commercial plan in JSON format:
 {{
   "brand_name": "{brand}",
-  "headline_top": "PURE ELEGANCE",
-  "headline_bottom": "EXPERIENCE NOW",
-  "signposts": ["Pro Quality", "CGI Grade", "Best Choice"],
-  "voiceover_script": "Making product ads until the world notices. Day eight. Behold the all-new {brand}! Engineered for {hint_clean}, bringing breathtaking 3D design and unmatched performance. Upgrade your standard today!"
+  "headline_top": "NEXT-GEN CGI",
+  "headline_bottom": "EXPERIENCE LUXURY",
+  "signposts": ["CGI Grade", "Ultra HD", "Masterpiece"],
+  "voiceover_script": "Behold the future. Introducing the all-new {brand}! Built with breathtaking 3D CGI precision for {hint_clean}. Elevate your standards and experience absolute perfection today."
 }}
 """
             resp = client.models.generate_content(
@@ -178,10 +116,10 @@ Create a 4-scene high-converting commercial plan in JSON format:
 
     return {
         "brand_name": brand[:16],
-        "headline_top": "PURE ELEGANCE",
-        "headline_bottom": "BUILT TO PERFECTION",
-        "signposts": ["Pro Quality", "CGI Grade", "Best Choice"],
-        "voiceover_script": f"Making product ads until the world notices. Day eight. Behold the all-new {brand}! Engineered for {hint_clean}, bringing breathtaking design and unmatched performance. Upgrade your standard today!"
+        "headline_top": "NEXT-GEN CGI",
+        "headline_bottom": "EXPERIENCE LUXURY",
+        "signposts": ["CGI Grade", "Ultra HD", "Masterpiece"],
+        "voiceover_script": f"Behold the future. Introducing the all-new {brand}! Built with breathtaking 3D CGI precision for {hint_clean}. Elevate your standards and experience absolute perfection today."
     }
 
 
@@ -193,50 +131,49 @@ async def create_voiceover(text: str, out_mp3: Path):
         gTTS(text=text, lang="en", tld="com").save(str(out_mp3))
 
 
-def animate_scene(keyframe_png: Path, mode: str, aspect_ratio: str, duration: float, out_mp4: Path):
-    W, H = (540, 960) if aspect_ratio == "9:16" else (960, 540)
-    fps = 24
-    total_frames = int(duration * fps)
+def generate_ai_video_scene(ref_image_path: Path, prompt: str, aspect_ratio: str, out_mp4: Path) -> bool:
+    """Fal.ai के एडवांस्ड वीडियो मॉडल का उपयोग करके असली Sora-style AI वीडियो जनरेट करता है"""
+    if not FAL_KEY:
+        raise RuntimeError("FAL_KEY is missing! Real Sora-style AI video generation requires a valid Fal.ai API Key.")
 
-    src = Image.open(keyframe_png).convert("RGB")
-    src = src.resize((int(W * 1.18), int(H * 1.18)), Image.Resampling.LANCZOS)
-    sw, sh = src.size
+    try:
+        img_bytes = ref_image_path.read_bytes()
+        data_uri = "data:image/png;base64," + base64.b64encode(img_bytes).decode("utf-8")
+        headers = {"Authorization": f"Key {FAL_KEY}", "Content-Type": "application/json"}
+        
+        with httpx.Client(timeout=300.0) as hc:
+            sub = hc.post(
+                f"https://queue.fal.run/{FAL_VIDEO_MODEL}",
+                headers=headers,
+                json={
+                    "image_url": data_uri,
+                    "prompt": prompt,
+                    "aspect_ratio": aspect_ratio,
+                    "num_inference_steps": 30,
+                    "guidance_scale": 7.5
+                },
+            )
+            sub.raise_for_status()
+            q = sub.json()
+            status_url = q.get("status_url")
+            response_url = q.get("response_url")
 
-    cmd = [
-        "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
-        "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", str(fps), "-i", "-",
-        "-c:v", "libx264", "-preset", "superfast", "-tune", "zerolatency", "-crf", "18",
-        "-pix_fmt", "yuv420p", "-threads", "1", str(out_mp4),
-    ]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-
-    for f in range(total_frames):
-        p = f / max(1, total_frames - 1)
-        if mode == "zoom_in":
-            scale = 1.0 + 0.14 * p
-            ox = int((sw - W / scale) * 0.5)
-            oy = int((sh - H / scale) * 0.5)
-        elif mode == "pan_right":
-            scale = 1.08
-            ox = int((sw - W / scale) * (0.2 + 0.6 * p))
-            oy = int((sh - H / scale) * 0.5)
-        elif mode == "dramatic_push":
-            scale = 1.02 + 0.15 * (p ** 0.85)
-            ox = int((sw - W / scale) * (0.5 + 0.05 * math.sin(p * math.pi)))
-            oy = int((sh - H / scale) * 0.48)
-        else:
-            scale = 1.12 - 0.1 * p
-            ox = int((sw - W / scale) * 0.5)
-            oy = int((sh - H / scale) * 0.5)
-
-        cw, ch = int(W / scale), int(H / scale)
-        ox = max(0, min(sw - cw, ox))
-        oy = max(0, min(sh - ch, oy))
-        frame = src.crop((ox, oy, ox + cw, oy + ch)).resize((W, H), Image.Resampling.BILINEAR)
-        proc.stdin.write(frame.tobytes())
-
-    proc.stdin.close()
-    proc.wait()
+            for _ in range(120): # 6 मिनट तक वेट करें
+                time.sleep(3)
+                st = hc.get(status_url, headers=headers).json()
+                if st.get("status") == "COMPLETED":
+                    res = hc.get(response_url, headers=headers).json()
+                    vurl = res.get("video", {}).get("url")
+                    if vurl:
+                        out_mp4.write_bytes(hc.get(vurl).content)
+                        return True
+                    break
+                if st.get("status") in ("FAILED", "CANCELLED"):
+                    raise RuntimeError(f"AI Video generation failed on Fal.ai: {st}")
+    except Exception as e:
+        raise RuntimeError(f"AI Video Error: {str(e)}")
+    
+    return False
 
 
 def _make_signpost_png(label: str, angle: float, out_png: Path):
@@ -284,26 +221,26 @@ def _create_headline_png(W: int, H: int, top_line: str, bottom_line: str, out_pn
 def run_pipeline(job_id: str, image_path: Path, hint: str):
     job_dir = image_path.parent
     try:
-        save_job(job_id, step="Planning 3D CGI Commercial & script...", progress=15)
+        save_job(job_id, step="Planning Sora-style CGI Commercial & script...", progress=15)
         plan = plan_commercial(image_path, hint)
         save_job(job_id, script=plan["voiceover_script"])
 
-        save_job(job_id, step="Recording cinematic voiceover...", progress=30)
+        save_job(job_id, step="Recording cinematic voiceover...", progress=25)
         voice_mp3 = job_dir / "voice.mp3"
         asyncio.run(create_voiceover(plan["voiceover_script"], voice_mp3))
 
         scene_videos = []
-        modes = [("zoom_in", 3.8), ("pan_right", 3.5), ("dramatic_push", 4.2), ("zoom_in", 3.5)]
+        scene_prompts = [
+            f"Photorealistic 3D CGI commercial opening shot: Cinematic studio rim lighting, dynamic glowing energy particles swirling around the exact product, 4k resolution, hyper-detailed motion.",
+            f"Ultra-detailed macro close-up shot: The exact product in active motion, cinematic depth of field, dramatic reflections, high-end commercial aesthetic.",
+            f"Dynamic 3D action sequence: Fluid light streaks and glowing particles orbiting the exact product in slow motion, luxury studio background.",
+            f"Clean hero packshot: The exact product standing boldly on a sleek futuristic glass podium with soft ambient glowing lights, premium commercial finish."
+        ]
 
         for idx in range(4):
-            save_job(job_id, step=f"Rendering CGI Scene {idx + 1}/4...", progress=40 + idx * 12)
-            kf_png = job_dir / f"kf_{idx}.png"
-            prepare_product_frame(image_path, kf_png, idx)
-
+            save_job(job_id, step=f"Generating AI Video Scene {idx + 1}/4 (Sora/Veo Style)...", progress=35 + idx * 15)
             sc_mp4 = job_dir / f"scene_{idx}.mp4"
-            mode, dur = modes[idx]
-            animate_scene(kf_png, mode, "9:16", dur, sc_mp4)
-            kf_png.unlink(missing_ok=True)
+            generate_ai_video_scene(image_path, scene_prompts[idx], "9:16", sc_mp4)
             scene_videos.append(sc_mp4)
 
         save_job(job_id, step="Adding CGI signposts, headline & assembling final ad...", progress=88)
@@ -316,7 +253,7 @@ def run_pipeline(job_id: str, image_path: Path, hint: str):
             base_vf = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps=24"
 
             if idx == 2:
-                labels = plan.get("signposts", ["Pro Quality", "CGI Grade", "Best Choice"])[:3]
+                labels = plan.get("signposts", ["CGI Grade", "Ultra HD", "Masterpiece"])[:3]
                 sp_paths = []
                 for s_i, lbl in enumerate(labels):
                     sp = job_dir / f"sign_{s_i}.png"
@@ -338,7 +275,7 @@ def run_pipeline(job_id: str, image_path: Path, hint: str):
                     sp.unlink(missing_ok=True)
             elif idx == 3:
                 head_png = job_dir / "headline.png"
-                _create_headline_png(W, H, plan.get("headline_top", "PURE ELEGANCE"), plan.get("headline_bottom", "EXPERIENCE NOW"), head_png)
+                _create_headline_png(W, H, plan.get("headline_top", "NEXT-GEN CGI"), plan.get("headline_bottom", "EXPERIENCE LUXURY"), head_png)
                 fc = f"[0:v]{base_vf}[b0];[b0][1:v]overlay=0:25[v]"
                 subprocess.run([
                     "ffmpeg", "-y", "-i", str(sc), "-i", str(head_png),
@@ -371,7 +308,7 @@ def run_pipeline(job_id: str, image_path: Path, hint: str):
             "-c:a", "aac", "-b:a", "128k", "-t", f"{target_dur:.2f}", "-movflags", "+faststart", str(final_mp4)
         ], check=True)
 
-        save_job(job_id, status="done", progress=100, step="Your Commercial Ad is ready!", video_url=f"/download/{job_id}")
+        save_job(job_id, status="done", progress=100, step="Your CGI Commercial is ready!", video_url=f"/download/{job_id}")
     except Exception as e:
         save_job(job_id, status="error", step=f"Error: {str(e)}")
 
@@ -385,7 +322,7 @@ async def generate_ad(image: UploadFile = File(...), hint: str = Form("")):
     with open(img_path, "wb") as f:
         shutil.copyfileobj(image.file, f)
 
-    save_job(job_id, status="processing", progress=5, step="Starting...")
+    save_job(job_id, status="processing", progress=5, step="Starting AI CGI generation...")
     threading.Thread(target=run_pipeline, args=(job_id, img_path, hint), daemon=True).start()
     return {"job_id": job_id}
 
@@ -407,7 +344,7 @@ def home():
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>AI Cinematic 3D Product Commercial Studio</title>
+  <title>AI 3D CGI Cinematic Commercial Studio</title>
   <style>
     body { font-family: system-ui, sans-serif; background: #070b14; color: #f8fafc; margin: 0; padding: 24px; }
     .card { max-width: 600px; margin: 0 auto; background: #111827; padding: 28px; border-radius: 16px; border: 1px solid #1f2937; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
@@ -424,14 +361,14 @@ def home():
 </head>
 <body>
   <div class="card">
-    <h1>🎬 AI 3D Cinematic Commercial Studio</h1>
-    <p style="color:#94a3b8;font-size:0.9rem;">Upload a product photo. AI automatically places it on a 3D luxury CGI studio background with glowing particles, dynamic camera pans, signposts & voiceover!</p>
+    <h1>🎬 AI 3D CGI Cinematic Studio</h1>
+    <p style="color:#94a3b8;font-size:0.9rem;">Upload a product photo. AI generates ultra-realistic Sora-style 3D video scenes with glowing particles, dynamic motion, signposts & voiceover!</p>
     <form id="adForm">
       <label>Product Photo</label>
       <input type="file" name="image" accept="image/*" required />
       <label>Product Benefits / Description</label>
-      <textarea name="hint" rows="2" placeholder="e.g. Luxury perfume bottle, long-lasting fragrance, elegant design"></textarea>
-      <button type="submit" id="submitBtn">🚀 Generate 3D Cinematic Ad</button>
+      <textarea name="hint" rows="2" placeholder="e.g. Luxury wristwatch, sleek metallic finish, timeless design"></textarea>
+      <button type="submit" id="submitBtn">🚀 Generate Sora-Style CGI Ad</button>
     </form>
     <div class="progress-box" id="progressBox">
       <div id="stepText">Processing...</div>
@@ -467,7 +404,7 @@ def home():
           alert(st.step);
           btn.disabled = false;
         }
-      }, 2000);
+      }, 3000);
     };
   </script>
 </body>
