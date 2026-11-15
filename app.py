@@ -20,13 +20,6 @@ from google import genai
 from google.genai import types
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
-def isolate_product(image_path: Path, output_png: Path) -> Path:
-    """ओरिजिनल इमेज से background हटाकर transparent product PNG बनाता है (Lazy Import)"""
-    from rembg import remove  # <--- यहाँ इम्पोर्ट करें ताकि स्टार्टअप पर हैंग न हो
-    img = Image.open(image_path).convert("RGB")
-    res = remove(img)
-    res.save(output_png, format="PNG")
-    return output_png
 
 app = FastAPI(title="AI Cinematic Product Commercial Studio")
 
@@ -87,10 +80,35 @@ def _load_font(size: int) -> ImageFont.FreeTypeFont:
 
 
 def isolate_product(image_path: Path, output_png: Path) -> Path:
-    """ओरिजिनल इमेज से background हटाकर transparent product PNG बनाता है (100% Free & Local)"""
-    img = Image.open(image_path).convert("RGB")
-    res = remove(img)
-    res.save(output_png, format="PNG")
+    """बिना भारी AI लाइब्रेरी के, प्रॉडक्ट को सिनेमैटिक स्टूडियो फ्रेम में सेट करता है (Lightning Fast & Render Safe)"""
+    img = Image.open(image_path).convert("RGBA")
+    
+    W, H = 540, 960
+    img.thumbnail((int(W * 0.75), int(H * 0.75)), Image.Resampling.LANCZOS)
+    
+    # सिनेमैटिक स्टूडियो बैकग्राउंड बनाएं
+    bg = Image.new("RGBA", (W, H), (18, 24, 38, 255))
+    draw = ImageDraw.Draw(bg)
+    for y in range(H):
+        r = int(18 + (35 - 18) * (y / H))
+        g = int(24 + (45 - 24) * (y / H))
+        b = int(38 + (65 - 38) * (y / H))
+        draw.line([(0, y), (W, y)], fill=(r, g, b, 255))
+
+    px = (W - img.width) // 2
+    py = (H - img.height) // 2
+
+    # रियलिस्टिक ड्रॉप शैडो बनाएं
+    shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    sh_layer = Image.new("RGBA", img.size, (0, 0, 0, 160))
+    shadow.paste(sh_layer, (px, py + 20), img)
+    shadow = shadow.filter(ImageFilter.GaussianBlur(15))
+
+    bg.alpha_composite(shadow)
+    bg.alpha_composite(img, (px, py))
+    
+    final_img = bg.convert("RGB")
+    final_img.save(output_png, format="PNG")
     return output_png
 
 
@@ -149,41 +167,14 @@ async def create_voiceover(text: str, out_mp3: Path):
 
 def generate_scene_frame(isolated_png: Path, scene_idx: int, aspect_ratio: str, out_png: Path):
     W, H = (540, 960) if aspect_ratio == "9:16" else (960, 540)
+    bg = Image.open(isolated_png).convert("RGB")
     
-    # सिनेमैटिक स्टूडियो बैकग्राउंड बनाएं
-    bg = Image.new("RGB", (W, H), (18, 24, 38))
-    draw = ImageDraw.Draw(bg)
-    
-    # सुंदर ग्रेडिएंट/लाइट इफ़ेक्ट दें
-    for y in range(H):
-        r = int(18 + (35 - 18) * (y / H))
-        g = int(24 + (45 - 24) * (y / H))
-        b = int(38 + (65 - 38) * (y / H))
-        draw.line([(0, y), (W, y)], fill=(r, g, b))
-
-    prod = Image.open(isolated_png).convert("RGBA")
-    
-    # सीन के हिसाब से प्रॉडक्ट का साइज़ और पोज़िशन बदलें ताकि वीडियो डायनेमिक लगे
-    if scene_idx == 0:
-        prod.thumbnail((int(W * 0.7), int(H * 0.7)), Image.Resampling.LANCZOS)
-    elif scene_idx == 1:
-        prod.thumbnail((int(W * 0.82), int(H * 0.82)), Image.Resampling.LANCZOS)
+    # सीन के हिसाब से हल्का вариации दें ताकि वीडियो डायनेमिक लगे
+    if scene_idx == 1:
+        bg = bg.rotate(1, resample=Image.Resampling.BICUBIC)
     elif scene_idx == 2:
-        prod.thumbnail((int(W * 0.75), int(H * 0.75)), Image.Resampling.LANCZOS)
-    else:
-        prod.thumbnail((int(W * 0.78), int(H * 0.78)), Image.Resampling.LANCZOS)
-
-    px = (W - prod.width) // 2
-    py = (H - prod.height) // 2 + (15 if scene_idx % 2 == 0 else -15)
-
-    # रियलिस्टिक ड्रॉप शैडो बनाएं
-    shadow = Image.new("RGBA", bg.size, (0, 0, 0, 0))
-    sh_layer = Image.new("RGBA", prod.size, (0, 0, 0, 140))
-    shadow.paste(sh_layer, (px, py + 25), prod)
-    shadow = shadow.filter(ImageFilter.GaussianBlur(12))
-    
-    bg.paste(shadow, (0, 0), shadow)
-    bg.paste(prod, (px, py), prod)
+        bg = bg.rotate(-1, resample=Image.Resampling.BICUBIC)
+        
     bg.save(out_png, format="PNG")
 
 
@@ -416,7 +407,7 @@ def home():
 <body>
   <div class="card">
     <h1>🎬 AI Cinematic Product Ad Studio</h1>
-    <p style="color:#94a3b8;font-size:0.9rem;">Upload a product photo. AI automatically extracts the product, places it on a cinematic studio background, adds animated pop-up signposts & English voiceover!</p>
+    <p style="color:#94a3b8;font-size:0.9rem;">Upload a product photo. AI automatically places it on a cinematic studio background, adds animated pop-up signposts & English voiceover!</p>
     <form id="adForm">
       <label>Product Photo</label>
       <input type="file" name="image" accept="image/*" required />
