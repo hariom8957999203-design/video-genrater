@@ -5,3 +5,4 @@ edge-tts
 httpx
 pillow
 gTTS
+python-multipart
